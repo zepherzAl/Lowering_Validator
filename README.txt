@@ -229,6 +229,8 @@ lowering_factor_validation_summary.csv
 lowering_rate_profile.json
 lowering_factor_validation_report.txt
 processing_log.txt
+run_log.txt  (whole run: settings, pre-run checks, EMS database steps and
+              every message, written even when a run is cancelled or fails)
 
 RUNNING AND RE-RUNNING
 ----------------------

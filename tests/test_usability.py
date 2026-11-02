@@ -232,5 +232,80 @@ class CancelAndConfirmTests(unittest.TestCase):
         self.assertIn("selected licences not found and skipped: L9", text)
 
 
+
+class RunLogTests(unittest.TestCase):
+    def test_cancelled_run_still_writes_run_log(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            settings = _settings(root, analysis_extent="TRACK_FOOTPRINT", survey_start="")
+            grid = _grid([("a", box(0, 0, 250, 250))])
+            licences = gpd.GeoDataFrame(
+                {"LicenceNo": ["L1"]}, geometry=[box(0, 0, 250, 250)], crs="EPSG:27700"
+            )
+            with (
+                patch.object(validator, "prepare_difference_raster", return_value="d.tif"),
+                patch.object(validator, "validate_bathymetric_difference_raster", return_value={}),
+                patch.object(validator, "read_vector", side_effect=[grid, licences]),
+                patch.object(validator, "load_ems"),
+            ):
+                with self.assertRaises(validator.RunCancelled):
+                    validator.run_validation(settings, confirm=lambda w: False)
+            text = (root / "out" / "run_log.txt").read_text(encoding="utf-8")
+        self.assertIn("Outcome:  CANCELLED: Run stopped after pre-run checks.", text)
+        self.assertIn("PRE-RUN CHECK: Survey start or end date is blank", text)
+        self.assertIn('"licence_filter": ""', text)
+
+
+class LowCoverageWarningTests(unittest.TestCase):
+    """Two 250 m cells on a 125 m raster; NoData pixels lower each cell's coverage."""
+
+    def _run(self, values):
+        import numpy as np
+        import rasterio
+        from rasterio.transform import from_origin
+
+        folder = tempfile.TemporaryDirectory()
+        self.addCleanup(folder.cleanup)
+        root = Path(folder.name)
+        proj = str(Path(rasterio.__file__).parent / "proj_data")
+        raster = root / "d.tif"
+        with patch.dict("os.environ", {"PROJ_LIB": proj}):
+            with rasterio.open(
+                raster, "w", driver="GTiff", width=4, height=2, count=1, dtype="float32",
+                crs="EPSG:27700", transform=from_origin(0, 250, 125, 125), nodata=-9999.0,
+            ) as dataset:
+                dataset.write(np.array(values, dtype=np.float32), 1)
+            grid = _grid([("A", box(0, 0, 250, 250)), ("B", box(250, 0, 500, 250))])
+            licences = gpd.GeoDataFrame(
+                {"LicenceNo": ["L1"]}, geometry=[box(0, 0, 500, 250)], crs="EPSG:27700"
+            )
+            ems = gpd.GeoDataFrame(
+                {"_datetime": [pd.Timestamp("2024-01-01")] * 90},
+                geometry=[Point(125, 125)] * 60 + [Point(375, 125)] * 30,
+                crs="EPSG:27700",
+            )
+            settings = validator.Settings(
+                difference_raster=str(raster), calibration_grid="g", licence_layer="l",
+                ems_source="e", output_folder=str(root / "out"),
+                background_correction="NONE", maximum_rate_tph=1e9,
+            )
+            messages = []
+            validator._run_validation_single(
+                settings, messages.append, grid_override=grid, licences_override=licences,
+                ems_override=ems, difference_raster_override=str(raster),
+            )
+        return "\n".join(messages)
+
+    def test_partly_covered_licence_names_coverage_as_cause(self):
+        n = -9999.0
+        log = self._run([[n, n, 0.5, 0.5], [n, 0.5, 0.5, 0.5]])  # A 25%, B 100%
+        self.assertIn("66.7% of EMS hours were excluded: 1.0 h in cells the difference raster covers less than 80%", log)
+
+    def test_uncovered_licence_says_no_rate_from_this_survey(self):
+        n = -9999.0
+        log = self._run([[n, n, n, n], [n, 0.5, 0.5, n]])  # A 25%, B 25%
+        self.assertIn("no rate - the difference raster covers too little of the dredged cells", log)
+
+
 if __name__ == "__main__":
     unittest.main()

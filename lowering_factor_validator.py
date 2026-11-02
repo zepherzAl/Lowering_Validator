@@ -4363,13 +4363,43 @@ def _run_validation_single(
             else np.nan
         )
         if np.isfinite(excluded_hours_pct) and excluded_hours_pct > 25.0:
-            log(
-                f"WARNING: licence {licence}: QA filters removed "
-                f"{excluded_hours_pct:.1f}% of EMS hours. Validated rate "
-                f"{rate_tph:.1f} t/h; rate using every cell with EMS time and "
-                f"valid bathymetry {all_ems_rate_tph:.1f} t/h. Dropping "
-                "low-change cells with their hours can raise the validated rate."
-            )
+            excluded = ems_cells.loc[~ems_cells["IncludeFlag"].astype(bool)]
+            low_coverage = excluded["CoveragePct"] < settings.minimum_coverage_percent
+            coverage_hours = float(excluded.loc[low_coverage, "EMS_Hours"].sum())
+            other_hours = float(excluded.loc[~low_coverage, "EMS_Hours"].sum())
+            causes = []
+            if coverage_hours > 0:
+                causes.append(
+                    f"{coverage_hours:,.1f} h in cells the difference raster covers "
+                    f"less than {settings.minimum_coverage_percent:g}%"
+                )
+            if other_hours > 0:
+                causes.append(
+                    f"{other_hours:,.1f} h in cells failing other checks "
+                    "(see QA_Reason)"
+                )
+            if total_hours <= 0 and coverage_hours >= 0.5 * all_ems_hours:
+                log(
+                    f"WARNING: licence {licence}: no rate - the difference raster "
+                    f"covers too little of the dredged cells "
+                    f"({int(low_coverage.sum())} cell(s) below "
+                    f"{settings.minimum_coverage_percent:g}% coverage, "
+                    f"{coverage_hours:,.1f} EMS hours). This survey does not "
+                    "measure the dredged area of this licence."
+                )
+            else:
+                log(
+                    f"WARNING: licence {licence}: {excluded_hours_pct:.1f}% of EMS "
+                    f"hours were excluded: {'; '.join(causes)}. Validated rate "
+                    f"{rate_tph:.1f} t/h; rate using every cell with EMS time and "
+                    f"valid bathymetry {all_ems_rate_tph:.1f} t/h."
+                    + (
+                        " Dropping low-change cells with their hours can raise "
+                        "the validated rate."
+                        if settings.rate_method == "CELL_FILTERS"
+                        else ""
+                    )
+                )
         weighted_median = np.nan
         if len(accepted):
             ordered = accepted.sort_values("ObsRate_tph")
@@ -4559,7 +4589,68 @@ def _run_validation_single(
     return summary_df
 
 
+RUN_LOG_NAME = "run_log.txt"
+
+
 def run_validation(
+    settings: Settings,
+    callback: Optional[Callable[[str], None]] = None,
+    *,
+    cancel_event: threading.Event | None = None,
+    confirm: Optional[Callable[[list[str]], bool]] = None,
+) -> pd.DataFrame:
+    """Run a validation and save every message to run_log.txt in the output folder.
+
+    The log is written however the run ends: completed, cancelled or failed.
+    """
+    lines: list[str] = []
+    started = datetime.now().astimezone()
+
+    def recording_callback(text: str) -> None:
+        lines.append(f"{datetime.now():%H:%M:%S}  {text}")
+        notify(callback, text)
+
+    outcome = "COMPLETED"
+    try:
+        return _run_validation(
+            settings, recording_callback, cancel_event=cancel_event, confirm=confirm
+        )
+    except RunCancelled as exc:
+        outcome = f"CANCELLED: {exc}"
+        raise
+    except BaseException as exc:
+        outcome = f"FAILED: {exc}"
+        if cancel_event is not None and cancel_event.is_set():
+            outcome = "CANCELLED: Run cancelled by user."
+        lines.append(traceback.format_exc())
+        raise
+    finally:
+        finished = datetime.now().astimezone()
+        header = [
+            f"{APP_NAME} v{VERSION} - run log",
+            f"Started:  {started.isoformat(timespec='seconds')}",
+            f"Finished: {finished.isoformat(timespec='seconds')} "
+            f"({(finished - started).total_seconds() / 60:.1f} min)",
+            f"Outcome:  {outcome}",
+            "",
+            "SETTINGS",
+            json.dumps(settings.as_dict(), indent=2),
+            "",
+            "MESSAGES",
+        ]
+        try:
+            # Only write where the run created (or found) its output folder, so
+            # a run stopped by an invalid raster leaves no folder behind.
+            folder = Path(settings.output_folder)
+            if folder.is_dir():
+                (folder / RUN_LOG_NAME).write_text(
+                    "\n".join(header + lines) + "\n", encoding="utf-8"
+                )
+        except OSError:
+            pass
+
+
+def _run_validation(
     settings: Settings,
     callback: Optional[Callable[[str], None]] = None,
     *,
@@ -5438,7 +5529,7 @@ class App(tk.Tk):
         output = Path(self._last_output or ".")
         ttk.Button(buttons, text="Open output folder", command=lambda: _open_path(output)).pack(side="left")
         ttk.Button(buttons, text="Open summary CSV", command=lambda: _open_newest(output, "lowering_factor_validation_summary*.csv")).pack(side="left", padx=6)
-        ttk.Button(buttons, text="Open processing log", command=lambda: _open_newest(output, "processing_log*.txt")).pack(side="left")
+        ttk.Button(buttons, text="Open run log", command=lambda: _open_path(output / RUN_LOG_NAME)).pack(side="left")
         ttk.Button(buttons, text="Close", command=window.destroy).pack(side="right")
 
     def _show_database_unavailable_dialog(
