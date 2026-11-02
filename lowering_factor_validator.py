@@ -129,6 +129,9 @@ class Settings:
     projected_crs: str = "EPSG:27700"
     resolution_mode: str = RESOLUTION_250
     write_model_factors: bool = False
+    background_correction: str = "UNDREDGED_CELLS"
+    background_min_cells: int = 5
+    rate_method: str = "POOLED"
 
     @classmethod
     def from_dict(cls, data: dict) -> "Settings":
@@ -232,6 +235,13 @@ class Settings:
             raise ValueError("Dredge comparison mode must be 'equals' or 'greater_or_equal'.")
         if not isinstance(self.write_model_factors, bool):
             raise ValueError("write_model_factors must be true or false.")
+        if self.background_correction not in {"NONE", "UNDREDGED_CELLS"}:
+            raise ValueError("Background correction must be NONE or UNDREDGED_CELLS.")
+        if int(self.background_min_cells) < 1:
+            raise ValueError("Background minimum cells must be at least 1.")
+        self.background_min_cells = int(self.background_min_cells)
+        if self.rate_method not in {"POOLED", "CELL_FILTERS"}:
+            raise ValueError("Rate method must be POOLED or CELL_FILTERS.")
 
         try:
             CRS.from_user_input(self.projected_crs)
@@ -315,6 +325,23 @@ def parse_cli_settings(argv: Optional[list[str]] = None) -> Settings:
         help=(
             "Fill blank lowering_factor values in the licence GeoPackage from "
             "the 250 m validated rates. Off unless this flag is given."
+        ),
+    )
+    parser.add_argument(
+        "--background-correction",
+        choices=["UNDREDGED_CELLS", "NONE"],
+        default=None,
+        help="Subtract the median lowering of undredged cells (natural change) before rates.",
+    )
+    parser.add_argument("--background-min-cells", type=int, default=None)
+    parser.add_argument(
+        "--rate-method",
+        choices=["POOLED", "CELL_FILTERS"],
+        default=None,
+        help=(
+            "POOLED: licence rate from every cell passing the EMS-hours and "
+            "coverage filters. CELL_FILTERS: also reject cells on detection "
+            "threshold and per-cell rate (previous behaviour)."
         ),
     )
     args = parser.parse_args(argv)
@@ -403,6 +430,9 @@ def parse_cli_settings(argv: Optional[list[str]] = None) -> Settings:
         "projected_crs": args.projected_crs,
         "resolution_mode": args.resolution_mode,
         "write_model_factors": args.write_model_factors,
+        "background_correction": args.background_correction,
+        "background_min_cells": args.background_min_cells,
+        "rate_method": args.rate_method,
     }
     for field_name, value in cli_overrides.items():
         if value is not None:
@@ -2688,6 +2718,84 @@ def zonal_change(grid: gpd.GeoDataFrame, raster_path: str, sign: str, log: Calla
     return pd.DataFrame(rows, columns=["ObsLower_m", "ValidArea_m2", "CoveragePct", "RasterPixels", "ChangeClass"])
 
 
+def estimate_background_lowering(
+    grid: pd.DataFrame,
+    settings: Settings,
+    log: Callable[[str], None],
+) -> dict[object, dict[str, object]]:
+    """Median lowering of undredged cells, per licence where possible.
+
+    Undredged cells have no EMS hours, valid bathymetry and adequate raster
+    coverage. Their lowering is natural change (or a survey offset), which also
+    happens between the narrow dredge furrows inside dredged cells, so it is
+    subtracted from every cell.
+    """
+    licences = list(pd.unique(grid["LicenceNo"]))
+    if settings.background_correction == "NONE":
+        log("Background correction: off (all observed lowering is treated as dredging).")
+        return {
+            licence: {"value": 0.0, "cells": 0, "iqr": np.nan, "source": "none"}
+            for licence in licences
+        }
+    lowering = pd.to_numeric(grid["ObsLower_m"], errors="coerce")
+    controls = (
+        pd.to_numeric(grid["EMS_Hours"], errors="coerce").fillna(0).eq(0)
+        & np.isfinite(lowering)
+        & pd.to_numeric(grid["CoveragePct"], errors="coerce").ge(
+            settings.minimum_coverage_percent
+        )
+    )
+    pooled = lowering[controls]
+    minimum = settings.background_min_cells
+    result: dict[object, dict[str, object]] = {}
+    for licence in licences:
+        own = lowering[controls & grid["LicenceNo"].eq(licence)]
+        if len(own) >= minimum:
+            values, source = own, "licence"
+        elif len(pooled) >= minimum:
+            values, source = pooled, "all licences"
+        else:
+            log(
+                f"WARNING: licence {licence}: only {len(own)} undredged cells "
+                f"({len(pooled)} across all licences); at least {minimum} are "
+                "needed, so no background correction was applied."
+            )
+            result[licence] = {
+                "value": 0.0, "cells": int(len(own)), "iqr": np.nan,
+                "source": "insufficient",
+            }
+            continue
+        median = float(values.median())
+        iqr = float(values.quantile(0.75) - values.quantile(0.25))
+        result[licence] = {
+            "value": median, "cells": int(len(values)), "iqr": iqr, "source": source,
+        }
+        log(
+            f"Background lowering for licence {licence}: {median:.3f} m "
+            f"(median of {len(values)} undredged cells, {source}; IQR {iqr:.3f} m). "
+            "Subtracted from every cell before volumes and rates."
+        )
+        if iqr > abs(median):
+            log(
+                f"WARNING: licence {licence}: undredged-cell lowering varies by "
+                "more than its median, so the background correction is "
+                "uncertain. Compare with the uncorrected and regression rates."
+            )
+    return result
+
+
+def _regression_rate_m3ph(volumes: pd.Series, hours: pd.Series) -> float:
+    """Slope of cell volume against EMS hours (m3/h), ignoring a constant offset."""
+    x = pd.to_numeric(hours, errors="coerce").to_numpy(dtype=float)
+    y = pd.to_numeric(volumes, errors="coerce").to_numpy(dtype=float)
+    keep = np.isfinite(x) & np.isfinite(y)
+    x, y = x[keep], y[keep]
+    if len(x) < 3 or np.ptp(x) == 0:
+        return float("nan")
+    slope, _ = np.polyfit(x, y, 1)
+    return float(slope)
+
+
 def _json_safe(value):
     if isinstance(value, dict):
         return {key: _json_safe(item) for key, item in value.items()}
@@ -2863,6 +2971,11 @@ def _build_validation_diagnostic_table(
         .gt(0)
     )
     calculated_columns = (
+        "RawObsLower_m",
+        "Background_m",
+        "ObsLower_m",
+        "ChangeClass",
+        "QA_Flags",
         "EMS_PointCount",
         "EMS_Min",
         "EMS_Hours",
@@ -2884,7 +2997,7 @@ def _build_validation_diagnostic_table(
                 dtype=(
                     "object"
                     if column
-                    in {"IncludeFlag", "CalibrationClass", "QA_Reason"}
+                    in {"IncludeFlag", "CalibrationClass", "QA_Reason", "ChangeClass", "QA_Flags"}
                     else "float64"
                 ),
             )
@@ -3244,11 +3357,19 @@ def _log_validation_diagnostics(
         f"None/missing: {rate['missing']:,}."
     )
     log(
-        "Cells rejected by an existing validation criterion: "
+        "Cells excluded from the licence rate: "
         f"{int((~valid_table['IncludeFlag'].astype('boolean').fillna(False)).sum()):,}"
     )
+    if getattr(settings, "rate_method", "CELL_FILTERS") == "POOLED":
+        log(
+            "Rate method POOLED: cells are excluded only for EMS_Hours < "
+            f"{settings.minimum_ems_hours:g} h, CoveragePct < "
+            f"{settings.minimum_coverage_percent:g}% or no valid bathymetry. "
+            "The summary below lists per-cell QA flags; detection-threshold "
+            "and per-cell rate flags do not remove cells from the licence rate."
+        )
     log(
-        "Existing criteria: EMS_Hours < "
+        "Per-cell criteria: EMS_Hours < "
         f"{settings.minimum_ems_hours:g} h; CoveragePct < "
         f"{settings.minimum_coverage_percent:g}%; ObsLower_m non-finite or < "
         f"{settings.minimum_detectable_change_m:g} m; ObsRate_tph non-finite "
@@ -3789,6 +3910,22 @@ def _run_validation_single(
     grid_calc["EMS_Min"] = grid_calc["EMS_PointCount"] * settings.sample_interval_minutes
     grid_calc["EMS_Hours"] = grid_calc["EMS_Min"] / 60.0
 
+    background = estimate_background_lowering(grid_calc, settings, log)
+    grid_calc["RawObsLower_m"] = grid_calc["ObsLower_m"]
+    grid_calc["Background_m"] = grid_calc["LicenceNo"].map(
+        lambda licence: background[licence]["value"]
+    ).astype(float)
+    grid_calc["ObsLower_m"] = grid_calc["RawObsLower_m"] - grid_calc["Background_m"]
+    grid_calc["ChangeClass"] = [
+        classify_change(value, settings.change_tolerance_m)
+        if np.isfinite(value)
+        else "NODATA_OR_EXCLUDED"
+        for value in grid_calc["ObsLower_m"]
+    ]
+    grid_calc["NetVolume_m3"] = grid_calc["ObsLower_m"] * grid_calc["ValidArea_m2"]
+    grid_calc["CutVolume_m3"] = np.where(grid_calc["NetVolume_m3"] > 0, grid_calc["NetVolume_m3"], 0.0)
+    grid_calc["FillVolume_m3"] = np.where(grid_calc["NetVolume_m3"] < 0, -grid_calc["NetVolume_m3"], 0.0)
+
     validation_calculation_started = time.perf_counter()
     with np.errstate(divide="ignore", invalid="ignore"):
         grid_calc["ObsRate_m3ph"] = grid_calc["NetVolume_m3"] / grid_calc["EMS_Hours"]
@@ -3799,20 +3936,27 @@ def _run_validation_single(
     reasons = []
     classes = []
     include = []
+    flags = []
+    pooled = settings.rate_method == "POOLED"
     for row in grid_calc.itertuples():
         cell_reasons = []
+        cell_flags = []
         if row.EMS_Hours < settings.minimum_ems_hours:
             cell_reasons.append("EMS time below minimum")
         if row.CoveragePct < settings.minimum_coverage_percent:
             cell_reasons.append("bathymetric coverage below minimum")
+        # In POOLED mode these are per-cell QA flags only: the licence rate is
+        # total volume / total hours, so low-change and high-rate cells stay in.
+        cell_checks = cell_flags if pooled else cell_reasons
         if not np.isfinite(row.ObsLower_m):
             cell_reasons.append("no valid bathymetric change")
         elif row.ObsLower_m < settings.minimum_detectable_change_m:
-            cell_reasons.append("lowering below detection threshold or accretion")
+            cell_checks.append("lowering below detection threshold or accretion")
         if not np.isfinite(row.ObsRate_tph) or row.ObsRate_tph <= 0:
-            cell_reasons.append("non-positive or invalid production rate")
+            cell_checks.append("non-positive or invalid production rate")
         elif row.ObsRate_tph > settings.maximum_rate_tph:
-            cell_reasons.append("production rate exceeds maximum")
+            cell_checks.append("production rate exceeds maximum")
+        flags.append("; ".join(cell_flags))
         accepted = not cell_reasons
         include.append(accepted)
         if accepted:
@@ -3827,6 +3971,7 @@ def _run_validation_single(
     grid_calc["IncludeFlag"] = include
     grid_calc["CalibrationClass"] = classes
     grid_calc["QA_Reason"] = reasons
+    grid_calc["QA_Flags"] = flags
     diagnostic_table = _build_validation_diagnostic_table(
         grid_with_raster_stats,
         grid_calc,
@@ -3974,6 +4119,20 @@ def _run_validation_single(
             "AcceptedVolume_m3": float(total_volume),
             "MeanCoveragePct": float(accepted["CoveragePct"].mean()) if len(accepted) else 0.0,
             "QA_Status": area_status,
+            "RateMethod": settings.rate_method,
+            "Background_m": background[licence]["value"],
+            "BackgroundCells": background[licence]["cells"],
+            "BackgroundIQR_m": background[licence]["iqr"],
+            "BackgroundSource": background[licence]["source"],
+            "UncorrectedRate_tph": (
+                float((accepted["RawObsLower_m"] * accepted["ValidArea_m2"]).sum())
+                / total_hours * settings.bulk_density
+                if total_hours > 0 else np.nan
+            ),
+            "RegressionRate_tph": _regression_rate_m3ph(
+                accepted["RawObsLower_m"] * accepted["ValidArea_m2"],
+                accepted["EMS_Hours"],
+            ) * settings.bulk_density,
             "AllEMSCellsRate_tph": all_ems_rate_tph,
             "AllEMSCellsHours": all_ems_hours,
             "ExcludedEMSHoursPct": excluded_hours_pct,
@@ -4026,6 +4185,9 @@ def _run_validation_single(
             "accepted_ems_hours": round(item["AcceptedEMS_Hours"], 6),
             "mean_coverage_percent": round(item["MeanCoveragePct"], 3),
             "qa_status": item["QA_Status"],
+            "rate_method": item["RateMethod"],
+            "background_lowering_m": None if not np.isfinite(item["Background_m"]) else round(item["Background_m"], 6),
+            "background_source": item["BackgroundSource"],
             "configured_rate_t_h": settings.configured_rate_tph,
             "created_by": f"{APP_NAME} v{VERSION}",
             "created_at": created,
@@ -4647,6 +4809,15 @@ class App(tk.Tk):
             onvalue="True",
             offvalue="False",
         ).grid(row=19, column=0, columnspan=2, sticky="w", padx=6, pady=3)
+        ttk.Label(fields, text="Background (natural) lowering correction").grid(row=20, column=0, sticky="w", padx=6, pady=3)
+        self.vars["background_correction"] = tk.StringVar(value="UNDREDGED_CELLS")
+        ttk.Combobox(fields, textvariable=self.vars["background_correction"], values=["UNDREDGED_CELLS", "NONE"], state="readonly").grid(row=20, column=1, sticky="ew", padx=6)
+        ttk.Label(fields, text="Minimum undredged cells for background").grid(row=21, column=0, sticky="w", padx=6, pady=3)
+        self.vars["background_min_cells"] = tk.StringVar(value="5")
+        ttk.Entry(fields, textvariable=self.vars["background_min_cells"]).grid(row=21, column=1, sticky="ew", padx=6)
+        ttk.Label(fields, text="Licence rate method").grid(row=22, column=0, sticky="w", padx=6, pady=3)
+        self.vars["rate_method"] = tk.StringVar(value="POOLED")
+        ttk.Combobox(fields, textvariable=self.vars["rate_method"], values=["POOLED", "CELL_FILTERS"], state="readonly").grid(row=22, column=1, sticky="ew", padx=6)
 
         qa = ttk.LabelFrame(body, text="3. Calculation and QA settings")
         qa.grid(row=2, column=0, sticky="ew", padx=10, pady=8)

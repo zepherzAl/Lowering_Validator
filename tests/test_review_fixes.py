@@ -9,7 +9,8 @@ import geopandas as gpd
 import numpy as np
 import rasterio
 from rasterio.transform import from_origin
-from shapely.geometry import box
+import pandas as pd
+from shapely.geometry import Point, box
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -95,6 +96,95 @@ class DocumentedSignTableTests(unittest.TestCase):
         for raw, convention, sign in cases:
             with self.subTest(convention=convention, sign=sign):
                 self.assertAlmostEqual(self._obs_lower(raw, convention, sign), 1.0)
+
+
+
+class BackgroundAndPooledRateTests(unittest.TestCase):
+    """Six 250 m cells: A dredged 1 h (1.0 m), B dredged 0.5 h (0.15 m), four undredged (0.1 m)."""
+
+    def setUp(self):
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp_dir.cleanup)
+        self.root = Path(self.temp_dir.name)
+        self.proj_data = str(Path(rasterio.__file__).parent / "proj_data")
+        self.raster = self.root / "difference.tif"
+        values = np.array([[0.1, 0.1, 0.1], [1.0, 0.15, 0.1]], dtype=np.float32)
+        with patch.dict("os.environ", {"PROJ_LIB": self.proj_data}):
+            with rasterio.open(
+                self.raster, "w", driver="GTiff", width=3, height=2, count=1,
+                dtype="float32", crs="EPSG:27700",
+                transform=from_origin(0, 500, 250, 250), nodata=-9999.0,
+            ) as dataset:
+                dataset.write(values, 1)
+        cells = {
+            "A": box(0, 0, 250, 250), "B": box(250, 0, 500, 250),
+            "C": box(500, 0, 750, 250), "D": box(0, 250, 250, 500),
+            "E": box(250, 250, 500, 500), "F": box(500, 250, 750, 500),
+        }
+        self.grid = gpd.GeoDataFrame(
+            {"GridID": list(cells)}, geometry=list(cells.values()), crs="EPSG:27700"
+        )
+        self.licences = gpd.GeoDataFrame(
+            {"LicenceNo": ["L1"]}, geometry=[box(0, 0, 750, 500)], crs="EPSG:27700"
+        )
+        points = [Point(125, 125)] * 60 + [Point(375, 125)] * 30
+        self.ems = gpd.GeoDataFrame(
+            {"_datetime": [pd.Timestamp("2024-01-01")] * len(points)},
+            geometry=points, crs="EPSG:27700",
+        )
+
+    def _run(self, **overrides):
+        output = self.root / ("-".join(f"{k}{v}" for k, v in overrides.items()) or "default")
+        options = {"background_min_cells": 4, **overrides}
+        settings = validator.Settings(
+            difference_raster=str(self.raster), calibration_grid="g.gpkg",
+            licence_layer="l.gpkg", ems_source="ems.csv", output_folder=str(output),
+            minimum_ems_hours=0.5, minimum_coverage_percent=80.0,
+            minimum_detectable_change_m=0.2, maximum_rate_tph=1e9,
+            sample_interval_minutes=1.0, bulk_density=1.0, **options,
+        )
+        messages = []
+        with patch.dict("os.environ", {"PROJ_LIB": self.proj_data}):
+            summary = validator._run_validation_single(
+                settings, messages.append, grid_override=self.grid,
+                licences_override=self.licences, ems_override=self.ems,
+                difference_raster_override=str(self.raster),
+            )
+        return summary.iloc[0], "\n".join(messages)
+
+    def test_background_is_removed_and_light_cells_stay_in_pooled_rate(self):
+        row, log = self._run()
+        self.assertAlmostEqual(row["Background_m"], 0.1, places=5)
+        self.assertEqual(row["BackgroundCells"], 4)
+        # (0.9 + 0.05) m x 62,500 m2 over 1.5 h
+        self.assertAlmostEqual(row["ValidatedRate_m3ph"], (56_250 + 3_125) / 1.5, places=0)
+        self.assertEqual(row["AcceptedCells"], 2)
+        self.assertAlmostEqual(row["UncorrectedRate_tph"], (62_500 + 9_375) / 1.5, places=0)
+        self.assertIn("Background lowering for licence L1: 0.100 m", log)
+
+    def test_cell_filters_mode_rejects_low_change_cell(self):
+        row, _ = self._run(rate_method="CELL_FILTERS")
+        self.assertEqual(row["AcceptedCells"], 1)
+        self.assertAlmostEqual(row["ValidatedRate_m3ph"], 56_250, places=0)
+
+    def test_background_correction_can_be_switched_off(self):
+        row, _ = self._run(background_correction="NONE")
+        self.assertEqual(row["Background_m"], 0.0)
+        self.assertAlmostEqual(row["ValidatedRate_m3ph"], (62_500 + 9_375) / 1.5, places=0)
+
+    def test_too_few_undredged_cells_skips_correction_with_warning(self):
+        row, log = self._run(background_min_cells=10)
+        self.assertEqual(row["Background_m"], 0.0)
+        self.assertEqual(row["BackgroundSource"], "insufficient")
+        self.assertIn("no background correction was applied", log)
+
+
+class RegressionRateTests(unittest.TestCase):
+    def test_slope_ignores_constant_offset(self):
+        hours = pd.Series([1.0, 2.0, 4.0])
+        volumes = 5_000 + 1_000 * hours
+        self.assertAlmostEqual(validator._regression_rate_m3ph(volumes, hours), 1_000)
+        self.assertTrue(np.isnan(validator._regression_rate_m3ph(volumes[:2], hours[:2])))
 
 
 if __name__ == "__main__":

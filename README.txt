@@ -165,12 +165,38 @@ Observed lowering factor = observed lowering / EMS hours
 Licence rate is calculated from total accepted volume / total accepted EMS hours,
 then converted to tonnes/hour using the entered bulk density.
 
-Cells rejected by the QA filters lose their volume and their EMS hours. Because
-cells with lowering below the detection threshold are rejected, this can raise
-the validated rate. For comparison the summary also reports
-AllEMSCellsRate_tph (every cell with EMS time and valid bathymetry),
-AllEMSCellsHours and ExcludedEMSHoursPct. The log warns when the filters remove
-more than 25% of a licence's EMS hours.
+BACKGROUND (NATURAL) LOWERING
+Cells with no EMS hours still change: natural seabed movement, or a small
+vertical offset between the two surveys. That change also happens between the
+narrow (about 2 m) dredge furrows inside dredged cells. With
+background_correction = UNDREDGED_CELLS (default) the Validator takes the
+median lowering of undredged cells (no EMS hours, valid bathymetry, coverage at
+or above the minimum) and subtracts it from every cell before volumes and
+rates. Each licence uses its own undredged cells when it has at least
+background_min_cells (default 5); otherwise all licences are pooled; with too
+few cells overall no correction is applied and the log warns. The log also
+warns when the undredged-cell spread (IQR) is larger than the median. Set
+NONE to treat all lowering as dredging.
+Columns: RawObsLower_m (before correction), Background_m, ObsLower_m (after).
+
+RATE METHOD
+POOLED (default): the licence rate is total corrected volume / total EMS hours
+over every cell with at least the minimum EMS hours and raster coverage.
+Detection-threshold, non-positive-rate and maximum-rate checks are reported in
+QA_Flags per cell but do not remove cells, because averaged over a 250 m cell
+random survey error is small and dropping lightly dredged cells (with their
+hours) biases the rate upward. CELL_FILTERS: the earlier behaviour, where those
+checks also reject cells.
+
+Summary checks: UncorrectedRate_tph (same cells, no background correction),
+RegressionRate_tph (slope of raw cell volume against EMS hours; it ignores any
+constant background), AllEMSCellsRate_tph (every cell with EMS time and valid
+bathymetry), AllEMSCellsHours and ExcludedEMSHoursPct. The log warns when the
+filters remove more than 25% of a licence's EMS hours.
+
+Per-cell rates (ObsRate_tph) are a QA map only: with a 2 m footprint and the
+EMS position some distance from the draghead, cells with few hours are noisy.
+Treat 50 m results as exploratory for the same reason.
 
 EMS hours = sampled records x EMS sample interval. The sample interval must
 match how often EMS logs records. The log reports the median gap between
