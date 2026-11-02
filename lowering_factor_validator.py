@@ -5244,6 +5244,22 @@ class App(tk.Tk):
         canvas.configure(yscrollcommand=scroll.set)
         canvas.pack(side="left", fill="both", expand=True)
         scroll.pack(side="right", fill="y")
+
+        def on_wheel(event):
+            # Leave scrolling to the log box and open dropdown lists.
+            if isinstance(event.widget, (tk.Text, tk.Listbox)) or str(event.widget).endswith("popdown.f.l"):
+                return
+            if getattr(event, "num", None) == 4:
+                step = -3
+            elif getattr(event, "num", None) == 5:
+                step = 3
+            else:
+                step = -1 * int(event.delta / 120) * 3 if abs(event.delta) >= 120 else -int(event.delta)
+            canvas.yview_scroll(step, "units")
+
+        self.bind_all("<MouseWheel>", on_wheel, add="+")
+        self.bind_all("<Button-4>", on_wheel, add="+")
+        self.bind_all("<Button-5>", on_wheel, add="+")
         body.columnconfigure(0, weight=1)
 
         files = ttk.LabelFrame(body, text="1. Input and output data")
@@ -5357,14 +5373,6 @@ class App(tk.Tk):
         ttk.Label(fields, text="Analysis extent").grid(row=18, column=0, sticky="w", padx=6, pady=3)
         self.vars["analysis_extent"] = tk.StringVar(value="FULL_OVERLAP")
         ttk.Combobox(fields, textvariable=self.vars["analysis_extent"], values=["TRACK_FOOTPRINT", "VALIDATION_POLYGON", "FULL_OVERLAP"], state="readonly").grid(row=18, column=1, sticky="ew", padx=6)
-        self.vars["write_model_factors"] = tk.StringVar(value="False")
-        ttk.Checkbutton(
-            fields,
-            text="Fill blank lowering_factor values in the licence GeoPackage (250 m)",
-            variable=self.vars["write_model_factors"],
-            onvalue="True",
-            offvalue="False",
-        ).grid(row=19, column=0, columnspan=2, sticky="w", padx=6, pady=3)
         ttk.Label(fields, text="Background (natural) lowering correction").grid(row=20, column=0, sticky="w", padx=6, pady=3)
         self.vars["background_correction"] = tk.StringVar(value="UNDREDGED_CELLS")
         ttk.Combobox(fields, textvariable=self.vars["background_correction"], values=["UNDREDGED_CELLS", "NONE"], state="readonly").grid(row=20, column=1, sticky="ew", padx=6)
@@ -5386,35 +5394,6 @@ class App(tk.Tk):
             onvalue="True",
             offvalue="False",
         ).grid(row=24, column=0, columnspan=3, sticky="w", padx=6, pady=3)
-        ttk.Label(fields, text="Model to update (write-back target)").grid(row=25, column=0, sticky="w", padx=6, pady=3)
-        self.vars["model_path"] = tk.StringVar(value="")
-        ttk.Entry(fields, textvariable=self.vars["model_path"]).grid(row=25, column=1, sticky="ew", padx=6)
-
-        def browse_model():
-            value = filedialog.askopenfilename(
-                title="Select the Lowering Model GeoPackage",
-                filetypes=[("GeoPackage", "*.gpkg"), ("All files", "*.*")],
-            )
-            if value:
-                self.vars["model_path"].set(value)
-
-        ttk.Button(fields, text="Select file...", command=browse_model).grid(row=25, column=2, padx=4)
-        ttk.Label(fields, text="Model layer").grid(row=26, column=0, sticky="w", padx=6, pady=3)
-        self.vars["model_layer"] = tk.StringVar(value="areas")
-        model_layer_combo = ttk.Combobox(fields, textvariable=self.vars["model_layer"], state="readonly", values=["areas"])
-        model_layer_combo.grid(row=26, column=1, sticky="ew", padx=6)
-        ttk.Button(
-            fields,
-            text="Load layers",
-            command=lambda: self.load_vector_layers("model_path", "model_id_field", "model_layer", model_layer_combo),
-        ).grid(row=26, column=2, padx=4)
-        ttk.Label(fields, text="Model area ID field (matched to licence number)").grid(row=27, column=0, sticky="w", padx=6, pady=3)
-        self.vars["model_id_field"] = tk.StringVar(value="area_id")
-        ttk.Entry(fields, textvariable=self.vars["model_id_field"]).grid(row=27, column=1, sticky="ew", padx=6)
-        ttk.Label(
-            fields,
-            text="Leave 'Model to update' blank to write to the licence layer instead.",
-        ).grid(row=28, column=1, columnspan=2, sticky="w", padx=6, pady=(0, 3))
 
         qa = ttk.LabelFrame(body, text="3. Calculation and QA settings")
         qa.grid(row=2, column=0, sticky="ew", padx=10, pady=8)
@@ -5428,8 +5407,51 @@ class App(tk.Tk):
         ]
         for r, item in enumerate(numeric): self.add_entry(qa, r, *item)
 
+        writeback = ttk.LabelFrame(body, text="4. Model write-back (optional)")
+        writeback.grid(row=3, column=0, sticky="ew", padx=10, pady=8)
+        writeback.columnconfigure(1, weight=1)
+        self.vars["write_model_factors"] = tk.StringVar(value="False")
+        ttk.Checkbutton(
+            writeback,
+            text="Write the validated 250 m lowering factor to the model "
+            "(fills blank lowering_factor values only)",
+            variable=self.vars["write_model_factors"],
+            onvalue="True",
+            offvalue="False",
+        ).grid(row=0, column=0, columnspan=3, sticky="w", padx=6, pady=3)
+        ttk.Label(writeback, text="Model to update (write-back target)").grid(row=1, column=0, sticky="w", padx=6, pady=3)
+        self.vars["model_path"] = tk.StringVar(value="")
+        ttk.Entry(writeback, textvariable=self.vars["model_path"]).grid(row=1, column=1, sticky="ew", padx=6)
+
+        def browse_model():
+            value = filedialog.askopenfilename(
+                title="Select the Lowering Model GeoPackage",
+                filetypes=[("GeoPackage", "*.gpkg"), ("All files", "*.*")],
+            )
+            if value:
+                self.vars["model_path"].set(value)
+
+        ttk.Button(writeback, text="Select file...", command=browse_model).grid(row=1, column=2, padx=4)
+        ttk.Label(writeback, text="Model layer").grid(row=2, column=0, sticky="w", padx=6, pady=3)
+        self.vars["model_layer"] = tk.StringVar(value="areas")
+        model_layer_combo = ttk.Combobox(writeback, textvariable=self.vars["model_layer"], state="readonly", values=["areas"])
+        model_layer_combo.grid(row=2, column=1, sticky="ew", padx=6)
+        ttk.Button(
+            writeback,
+            text="Load layers",
+            command=lambda: self.load_vector_layers("model_path", "model_id_field", "model_layer", model_layer_combo),
+        ).grid(row=2, column=2, padx=4)
+        ttk.Label(writeback, text="Model area ID field (matched to licence number)").grid(row=3, column=0, sticky="w", padx=6, pady=3)
+        self.vars["model_id_field"] = tk.StringVar(value="area_id")
+        ttk.Entry(writeback, textvariable=self.vars["model_id_field"]).grid(row=3, column=1, sticky="ew", padx=6)
+        ttk.Label(
+            writeback,
+            text="Leave 'Model to update' blank to write to the licence layer instead.",
+        ).grid(row=4, column=1, columnspan=2, sticky="w", padx=6, pady=(0, 3))
+
+
         action = ttk.Frame(body)
-        action.grid(row=3, column=0, sticky="ew", padx=10, pady=8)
+        action.grid(row=4, column=0, sticky="ew", padx=10, pady=8)
         self.run_button = ttk.Button(action, text="Run validation", command=self.run)
         self.run_button.pack(side="left")
         self.cancel_button = ttk.Button(action, text="Cancel", command=self.cancel_run, state="disabled")
@@ -5439,7 +5461,7 @@ class App(tk.Tk):
         ttk.Button(action, text="Show last results", command=self.show_last_results).pack(side="left", padx=8)
 
         status = ttk.Frame(body)
-        status.grid(row=4, column=0, sticky="ew", padx=10, pady=(0, 4))
+        status.grid(row=5, column=0, sticky="ew", padx=10, pady=(0, 4))
         status.columnconfigure(1, weight=1)
         self.stage_label = ttk.Label(status, text="Ready.")
         self.stage_label.grid(row=0, column=0, sticky="w")
@@ -5449,7 +5471,7 @@ class App(tk.Tk):
         self.elapsed_label.grid(row=0, column=2, sticky="e")
 
         log_frame = ttk.LabelFrame(body, text="Processing log")
-        log_frame.grid(row=5, column=0, sticky="nsew", padx=10, pady=8)
+        log_frame.grid(row=6, column=0, sticky="nsew", padx=10, pady=8)
         self.logbox = tk.Text(log_frame, height=12, wrap="word")
         self.logbox.pack(fill="both", expand=True, padx=6, pady=6)
 
