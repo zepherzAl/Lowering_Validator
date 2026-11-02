@@ -21,12 +21,12 @@ AREAS = {"A": box(0, 0, 1000, 250), "B": box(500, 0, 1500, 250)}
 FACTOR = 0.1  # m per hour of dredging in a 250 m cell
 
 
-def _write_model(path: Path) -> None:
+def _write_model(path: Path, factor: float = FACTOR) -> None:
     areas = gpd.GeoDataFrame(
         {
             "area_id": list(AREAS),
             "area_name": [f"Area {key}" for key in AREAS],
-            "lowering_factor": [FACTOR, FACTOR],
+            "lowering_factor": [factor, factor],
             "active": [1, 1],
         },
         geometry=list(AREAS.values()),
@@ -153,6 +153,40 @@ class SameNamedVesselFileTests(unittest.TestCase):
             sorted(combined["vessel"].unique()),
             ["232003506 - (Welsh Piper)", "232215000 - (Sand Falcon)"],
         )
+
+
+
+class SmallLoweringIsKeptTests(unittest.TestCase):
+    """10 minutes a quarter in a 250 m cell at 0.0169 m/h used to round to 0.00 m."""
+
+    def test_light_dredging_accumulates_over_quarters(self):
+        factor = 0.0169
+        sampled = _points((125, 125, 10))
+        tracks = (sampled, sampled, 10, 10, 10, 10, 1)
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            model_path = root / "model.gpkg"
+            _write_model(model_path, factor)
+            with patch.object(lowerer, "process_all_tracks", return_value=tracks):
+                outputs = lowerer.run_lowering_workflow(
+                    input_folder=root, model_path=model_path, output_folder=root,
+                    dredge_value=3, dredge_mode="equals", sample_minutes=1,
+                    use_date_filter=False, start_date=None, end_date=None,
+                    spatial_predicate="within", export_cleaned_csv=False,
+                    export_points_gpkg=False, export_grid_gpkg=True,
+                    export_summary_csv=False, processing_mode="Selected area",
+                    selected_area_id="A",
+                )
+                quarter_path = next(p for p in outputs if p.suffix == ".gpkg")
+                quarter = gpd.read_file(quarter_path)
+                cumulative = lowerer.update_multi_area_cumulative_grid(quarter_path, quarter)
+
+        cell = quarter.set_index("grid_id").loc["A_01"]
+        expected = 10 / 60 * factor  # 0.0028167 m
+        self.assertAlmostEqual(cell["lowering_m"], expected, places=6)
+        self.assertAlmostEqual(cell["volume_m3"], 10 / 60 * factor * 62_500, places=4)
+        two_quarters = cumulative.set_index("grid_id").loc["A_01", "lowering_m"]
+        self.assertAlmostEqual(two_quarters, 2 * expected, delta=1e-5)
 
 
 if __name__ == "__main__":

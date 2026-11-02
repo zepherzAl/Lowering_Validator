@@ -49,6 +49,10 @@ RESOLUTION_250 = "250 m Regulatory"
 RESOLUTION_50 = "50 m Internal Detail"
 RESOLUTION_BOTH = "Both"
 VOLUME_QC_TOLERANCE_M3 = 1e-6
+# Results keep 6 decimal places (a micrometre of lowering). They used to be
+# rounded to 0.01 before being added to cumulative totals, so a 250 m cell with
+# under ~18 minutes of dredging in a run recorded no lowering at all.
+VALUE_DECIMALS = 6
 
 
 def resource_path(relative_path: str) -> str:
@@ -361,8 +365,8 @@ def spatial_join_points_to_grid(
 
     active_cell_summary["time_minutes"] = active_cell_summary["point_count"] * sample_minutes
     active_cell_summary["time_hours"] = active_cell_summary["time_minutes"] / 60
-    active_cell_summary["volume_m3"] = (active_cell_summary["time_hours"] * volume_rate_m3_hr).round(2)
-    active_cell_summary["lowering_m"] = (active_cell_summary["time_hours"] * lowering_factor).round(2)
+    active_cell_summary["volume_m3"] = (active_cell_summary["time_hours"] * volume_rate_m3_hr).round(VALUE_DECIMALS)
+    active_cell_summary["lowering_m"] = (active_cell_summary["time_hours"] * lowering_factor).round(VALUE_DECIMALS)
 
     # IMPORTANT:
     # Always merge the active-cell summary back onto the full input grid using a left
@@ -371,12 +375,12 @@ def spatial_join_points_to_grid(
     grid_out = grid.merge(active_cell_summary, on=grid_id_col, how="left")
 
     grid_out["point_count"] = grid_out["point_count"].fillna(0).astype(int)
-    grid_out["time_minutes"] = grid_out["time_minutes"].fillna(0).round(2)
-    grid_out["time_hours"] = grid_out["time_hours"].fillna(0).round(2)
-    grid_out["volume_m3"] = grid_out["volume_m3"].fillna(0).round(2)
-    grid_out["lowering_m"] = grid_out["lowering_m"].fillna(0).round(2)
+    grid_out["time_minutes"] = grid_out["time_minutes"].fillna(0).round(VALUE_DECIMALS)
+    grid_out["time_hours"] = grid_out["time_hours"].fillna(0).round(VALUE_DECIMALS)
+    grid_out["volume_m3"] = grid_out["volume_m3"].fillna(0).round(VALUE_DECIMALS)
+    grid_out["lowering_m"] = grid_out["lowering_m"].fillna(0).round(VALUE_DECIMALS)
     grid_out["grid_area_m2"] = round(grid_area_m2, 2)
-    grid_out["lower_fac"] = round(lowering_factor, 6)
+    grid_out["lower_fac"] = round(lowering_factor, 9)
 
     # The CSV summary should also contain every grid cell, not just active cells.
     geometry_col = grid_out.geometry.name
@@ -569,12 +573,12 @@ def update_cumulative_grid(
         cumulative_grid = cumulative_grid.drop(columns=[quarter_col])
 
     cumulative_grid["point_count"] = cumulative_grid["point_count"].round(0).astype(int)
-    cumulative_grid["time_minutes"] = cumulative_grid["time_minutes"].round(2)
-    cumulative_grid["time_hours"] = cumulative_grid["time_hours"].round(2)
-    cumulative_grid["volume_m3"] = cumulative_grid["volume_m3"].round(2)
-    cumulative_grid["lowering_m"] = cumulative_grid["lowering_m"].round(2)
+    cumulative_grid["time_minutes"] = cumulative_grid["time_minutes"].round(VALUE_DECIMALS)
+    cumulative_grid["time_hours"] = cumulative_grid["time_hours"].round(VALUE_DECIMALS)
+    cumulative_grid["volume_m3"] = cumulative_grid["volume_m3"].round(VALUE_DECIMALS)
+    cumulative_grid["lowering_m"] = cumulative_grid["lowering_m"].round(VALUE_DECIMALS)
     cumulative_grid["grid_area_m2"] = round(grid_area_m2, 2)
-    cumulative_grid["lower_fac"] = round(lowering_factor, 6)
+    cumulative_grid["lower_fac"] = round(lowering_factor, 9)
 
     if log_callback:
         log_callback(f"Existing cumulative grid cells: {existing_cell_count:,}")
@@ -683,8 +687,8 @@ def update_multi_area_cumulative_grid(
     )
     cumulative["point_count"] = cumulative["point_count"].round(0).astype(int)
     cumulative["shared_point_count"] = cumulative["shared_point_count"].round(0).astype(int)
-    for column in ("time_minutes", "time_hours", "volume_m3", "lowering_m"):
-        cumulative[column] = cumulative[column].round(2)
+    for column in ("time_minutes", "time_hours", "volume_m3", "lowering_m", "shared_lowering_m"):
+        cumulative[column] = cumulative[column].round(VALUE_DECIMALS)
     cumulative["calculated_lowering"] = cumulative["lowering_m"]
     result = gpd.GeoDataFrame(cumulative, geometry="geometry", crs=existing.crs)
     if log_callback:
@@ -1272,7 +1276,7 @@ def run_lowering_workflow(
             )
             grid_out["shared_lowering_m"] = (
                 grid_out["shared_point_count"] * sample_minutes / 60.0 * factor
-            ).round(4)
+            ).round(VALUE_DECIMALS)
             grid_out["area_id"] = area["area_id"]
             grid_out["area_name"] = area_name
             grid_out["lowering_factor"] = factor
