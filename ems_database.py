@@ -1354,6 +1354,31 @@ class EMSDatabase:
                 )
         return updated
 
+    def months_without_records(
+        self, profile: str, start: datetime, end: datetime
+    ) -> list[str]:
+        """Calendar months between start and end with no EMS rows at all."""
+        root = str(self.source_root)
+        missing: list[str] = []
+        year, month = start.year, start.month
+        with self._connection() as connection:
+            while (year, month) <= (end.year, end.month):
+                next_year, next_month = (year + 1, 1) if month == 12 else (year, month + 1)
+                row = connection.execute(
+                    "SELECT 1 FROM ems_records WHERE source_root = ? AND profile = ? "
+                    "AND timestamp >= ? AND timestamp < ? LIMIT 1",
+                    (
+                        root,
+                        profile,
+                        f"{year:04d}-{month:02d}-01 00:00:00.000000",
+                        f"{next_year:04d}-{next_month:02d}-01 00:00:00.000000",
+                    ),
+                ).fetchone()
+                if row is None:
+                    missing.append(f"{year:04d}-{month:02d}")
+                year, month = next_year, next_month
+        return missing
+
     def record_count(self, profile: str) -> int:
         with self._connection() as connection:
             row = connection.execute(

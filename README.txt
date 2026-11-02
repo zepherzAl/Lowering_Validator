@@ -230,6 +230,31 @@ lowering_rate_profile.json
 lowering_factor_validation_report.txt
 processing_log.txt
 
+RUNNING AND RE-RUNNING
+----------------------
+Reuse EMS data (ticked by default): the sampled EMS records are saved in
+<output folder>\ems_cache after a run. A later run with the same EMS folder,
+field names, dredge filter, survey dates and sample interval, over the same or a
+smaller grid extent, loads them instead of querying the EMS database. Untick it
+after adding or changing EMS files. Command line: --no-ems-cache.
+
+Licences to run: leave blank for all, or type IDs separated by commas, or use
+"Choose..." to pick from the licence layer. Only grid cells inside the chosen
+licences are used. Command line: --licences "137, 522".
+
+Pre-run checks run before the slow EMS stage and report: overlapping grid
+cells (counted twice), licences with no grid cells, blank or reversed survey
+dates, calendar months in the survey period with no EMS records at all, and a
+raster whose sign settings make few pixels read as lowering. The app asks
+whether to continue; the command line logs them and continues.
+
+While running, the window shows the current stage and elapsed time. Cancel
+stops at the next safe point (an EMS file being imported is rolled back).
+When the run finishes, a results window lists each licence with the validated,
+uncorrected and regression rates, background, cells and hours used, with
+buttons to open the output folder, summary CSV and processing log. "Show last
+results" reopens it.
+
 INSTALLATION
 ------------
 Store all files locally. From a command prompt in this folder:

@@ -15,11 +15,13 @@ from __future__ import annotations
 
 import argparse
 import collections
+import hashlib
 import itertools
 import json
 import math
 import os
 import queue
+import re
 import sqlite3
 import subprocess
 import sys
@@ -132,6 +134,8 @@ class Settings:
     background_correction: str = "UNDREDGED_CELLS"
     background_min_cells: int = 5
     rate_method: str = "POOLED"
+    reuse_ems_cache: bool = True
+    licence_filter: str = ""
 
     @classmethod
     def from_dict(cls, data: dict) -> "Settings":
@@ -242,6 +246,10 @@ class Settings:
         self.background_min_cells = int(self.background_min_cells)
         if self.rate_method not in {"POOLED", "CELL_FILTERS"}:
             raise ValueError("Rate method must be POOLED or CELL_FILTERS.")
+        if not isinstance(self.reuse_ems_cache, bool):
+            raise ValueError("reuse_ems_cache must be true or false.")
+        if not isinstance(self.licence_filter, str):
+            raise ValueError("licence_filter must be text, e.g. '137, 522'.")
 
         try:
             CRS.from_user_input(self.projected_crs)
@@ -334,6 +342,20 @@ def parse_cli_settings(argv: Optional[list[str]] = None) -> Settings:
         help="Subtract the median lowering of undredged cells (natural change) before rates.",
     )
     parser.add_argument("--background-min-cells", type=int, default=None)
+    parser.add_argument(
+        "--no-ems-cache",
+        dest="reuse_ems_cache",
+        action="store_const",
+        const=False,
+        default=None,
+        help="Query the EMS database even when saved EMS records match.",
+    )
+    parser.add_argument(
+        "--licences",
+        dest="licence_filter",
+        default=None,
+        help="Comma-separated licence IDs to run (default: all).",
+    )
     parser.add_argument(
         "--rate-method",
         choices=["POOLED", "CELL_FILTERS"],
@@ -433,6 +455,8 @@ def parse_cli_settings(argv: Optional[list[str]] = None) -> Settings:
         "background_correction": args.background_correction,
         "background_min_cells": args.background_min_cells,
         "rate_method": args.rate_method,
+        "reuse_ems_cache": args.reuse_ems_cache,
+        "licence_filter": args.licence_filter,
     }
     for field_name, value in cli_overrides.items():
         if value is not None:
@@ -1436,6 +1460,7 @@ def _query_sampled_ems(
     seconds: int,
     log: Callable[[str], None],
     label: str,
+    cancel_event: threading.Event | None = None,
 ) -> dict[str, object]:
     spatial_first = query_bounds_by_crs is not None
     state: list[object] = [object(), None]
@@ -1464,6 +1489,7 @@ def _query_sampled_ems(
         log=log,
         spatial_first=spatial_first,
         diagnostic_label=label,
+        cancel_event=cancel_event,
     )
     if label == "Current pathway":
         log(
@@ -1577,12 +1603,267 @@ def _query_sampled_ems(
     }
 
 
+class RunCancelled(RuntimeError):
+    """Raised when the user cancels a run or stops it after pre-run checks."""
+
+
+EMS_CACHE_VERSION = "ems-cache-v1"
+VECTOR_EMS_EXTENSIONS = {".gpkg", ".shp", ".geojson", ".tab"}
+
+
+def selected_licences(settings: Settings) -> list[str]:
+    """Licence IDs from the licence filter text; empty means all licences."""
+    return [
+        item.strip()
+        for item in re.split(r"[,;\n]", settings.licence_filter or "")
+        if item.strip()
+    ]
+
+
+def _ems_source_kind(settings: Settings) -> str:
+    source = Path(settings.ems_source)
+    if source.is_file() and source.suffix.lower() in VECTOR_EMS_EXTENSIONS:
+        return "vector"
+    return "delimited"
+
+
+def _ems_profile(settings: Settings, source_kind: str) -> str:
+    profile_settings = {
+        "kind": source_kind,
+        "x": settings.ems_x_field,
+        "y": settings.ems_y_field,
+        "datetime": settings.ems_datetime_field,
+        "time": settings.ems_time_field,
+        "dredge": settings.ems_dredge_field,
+        "vessel": settings.ems_vessel_field,
+    }
+    return "validator:" + json.dumps(profile_settings, sort_keys=True)
+
+
+def _ems_cache_paths(settings: Settings) -> tuple[Path, Path]:
+    key = {
+        "version": EMS_CACHE_VERSION,
+        "source": os.path.abspath(settings.ems_source),
+        "profile": _ems_profile(settings, _ems_source_kind(settings)),
+        "dredge_value": settings.ems_dredge_value,
+        "dredge_mode": settings.ems_dredge_mode,
+        "survey_start": settings.survey_start,
+        "survey_end": settings.survey_end,
+        "sample_interval_minutes": settings.sample_interval_minutes,
+    }
+    digest = hashlib.sha256(
+        json.dumps(key, sort_keys=True).encode("utf-8")
+    ).hexdigest()[:16]
+    folder = Path(settings.output_folder) / "ems_cache"
+    return folder / f"ems_{digest}.pkl", folder / f"ems_{digest}.json"
+
+
+def find_ems_cache(
+    settings: Settings, area_grid: gpd.GeoDataFrame
+) -> tuple[Path, dict] | None:
+    """Saved EMS records matching these settings and covering the grid, if any."""
+    if not settings.reuse_ems_cache:
+        return None
+    data_path, meta_path = _ems_cache_paths(settings)
+    if not data_path.exists() or not meta_path.exists():
+        return None
+    try:
+        meta = json.loads(meta_path.read_text(encoding="utf-8"))
+        bounds = tuple(float(v) for v in area_grid.total_bounds)
+        if CRS.from_user_input(meta["crs"]) != CRS.from_user_input(area_grid.crs):
+            bounds = Transformer.from_crs(
+                area_grid.crs, meta["crs"], always_xy=True
+            ).transform_bounds(*bounds, densify_pts=21)
+        cached = meta["bounds"]
+        tolerance = 1e-6
+        covers = (
+            cached[0] - tolerance <= bounds[0]
+            and cached[1] - tolerance <= bounds[1]
+            and cached[2] + tolerance >= bounds[2]
+            and cached[3] + tolerance >= bounds[3]
+        )
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+    return (data_path, meta) if covers else None
+
+
+def load_ems_cached(
+    settings: Settings,
+    log: Callable[[str], None],
+    area_grid: gpd.GeoDataFrame,
+    *,
+    cancel_event: threading.Event | None = None,
+) -> gpd.GeoDataFrame:
+    """Load sampled EMS records, reusing the saved copy when settings match."""
+    found = find_ems_cache(settings, area_grid)
+    if found is not None:
+        data_path, meta = found
+        try:
+            ems = pd.read_pickle(data_path)
+            log(
+                f"Using saved EMS records from {meta.get('created_at', 'an earlier run')} "
+                f"({len(ems):,} records). Untick 'Reuse EMS data' to rebuild them "
+                "from the EMS database (needed if EMS files have changed)."
+            )
+            return ems
+        except Exception as exc:  # corrupt or incompatible pickle
+            log(f"Could not read saved EMS records ({exc}); querying the EMS database.")
+    elif settings.reuse_ems_cache:
+        log("No saved EMS records match these settings and grid extent; querying the EMS database.")
+    ems = load_ems(settings, log, area_grid, cancel_event=cancel_event)
+    data_path, meta_path = _ems_cache_paths(settings)
+    try:
+        data_path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = data_path.with_suffix(".partial")
+        ems.to_pickle(temporary)
+        temporary.replace(data_path)
+        meta_path.write_text(
+            json.dumps(
+                {
+                    "created_at": datetime.now().astimezone().isoformat(timespec="seconds"),
+                    "crs": CRS.from_user_input(area_grid.crs).to_wkt(),
+                    "bounds": [float(v) for v in area_grid.total_bounds],
+                    "records": int(len(ems)),
+                    "settings": {
+                        "ems_source": settings.ems_source,
+                        "survey_start": settings.survey_start,
+                        "survey_end": settings.survey_end,
+                        "ems_dredge_value": settings.ems_dredge_value,
+                    },
+                },
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+        log(f"Saved EMS records for reuse in later runs: {data_path}")
+    except OSError as exc:
+        log(f"WARNING: could not save EMS records for reuse: {exc}")
+    return ems
+
+
+def _grid_overlaps(
+    grid: gpd.GeoDataFrame, grid_id_column: str, projected_crs: str
+) -> list[tuple[str, str, float]]:
+    """Pairs of grid cells overlapping by more than 1% of the smaller cell."""
+    work = grid[[grid_id_column, "geometry"]].to_crs(projected_crs).reset_index(drop=True)
+    geometries = work.geometry
+    tree = geometries.sindex
+    left, right = tree.query(geometries, predicate="intersects")
+    pairs = []
+    for i, j in zip(left, right):
+        if i >= j:
+            continue
+        a, b = geometries.iloc[i], geometries.iloc[j]
+        area = a.intersection(b).area
+        if area > 0.01 * min(a.area, b.area):
+            pairs.append(
+                (str(work[grid_id_column].iloc[i]), str(work[grid_id_column].iloc[j]), float(area))
+            )
+    return pairs
+
+
+def preflight_checks(
+    settings: Settings,
+    master_grid: gpd.GeoDataFrame,
+    licences: gpd.GeoDataFrame,
+    grid_id_column: str,
+    raster_validation: dict | None,
+    log: Callable[[str], None],
+    *,
+    check_ems_months: bool = True,
+) -> list[str]:
+    """Quick checks before the slow EMS stage. Returns plain-English warnings."""
+    log("Running pre-run checks...")
+    warnings: list[str] = []
+
+    overlaps = _grid_overlaps(master_grid, grid_id_column, settings.projected_crs)
+    if overlaps:
+        examples = ", ".join(f"{a}/{b}" for a, b, _ in overlaps[:5])
+        warnings.append(
+            f"{len(overlaps):,} pairs of grid cells overlap (for example {examples}). "
+            "Lowering and EMS hours in overlapping areas are counted twice. "
+            "Use a grid layer with one cell per location."
+        )
+
+    licence_field = field_lookup(licences.columns, settings.licence_field)
+    work_licences = licences.to_crs(master_grid.crs)
+    points = gpd.GeoDataFrame(
+        geometry=master_grid.geometry.representative_point(), crs=master_grid.crs
+    )
+    joined = gpd.sjoin(points, work_licences[[licence_field, "geometry"]], predicate="within")
+    with_cells = set(joined[licence_field].astype(str))
+    empty = [
+        str(value) for value in work_licences[licence_field].astype(str)
+        if str(value) not in with_cells
+    ]
+    if empty:
+        warnings.append(
+            f"{len(empty)} licence(s) have no grid cells and will get no result: "
+            + ", ".join(empty[:10])
+        )
+
+    start = validate_date(settings.survey_start, "Survey start")
+    end = validate_date(settings.survey_end, "Survey end")
+    if start is None or end is None:
+        warnings.append(
+            "Survey start or end date is blank, so EMS records from all dates are "
+            "used. Enter the two survey dates so only dredging between them counts."
+        )
+    elif start >= end:
+        warnings.append(
+            f"Survey start ({settings.survey_start}) is not before survey end "
+            f"({settings.survey_end})."
+        )
+    elif check_ems_months:
+        source = Path(settings.ems_source)
+        try:
+            if source.exists() and EMSDatabase.exists(source):
+                database = EMSDatabase(source)
+                missing = database.months_without_records(
+                    _ems_profile(settings, _ems_source_kind(settings)),
+                    start.to_pydatetime(),
+                    end.to_pydatetime(),
+                )
+                if missing:
+                    warnings.append(
+                        f"The EMS database has no records at all for {len(missing)} "
+                        f"month(s) in the survey period: {', '.join(missing[:12])}"
+                        + (" ..." if len(missing) > 12 else "")
+                        + ". Dredging in those months is missing, which overstates "
+                        "the rate (newly added EMS files are imported during the run)."
+                    )
+        except Exception as exc:  # the check must never block a run
+            log(f"EMS month coverage check skipped: {exc}")
+
+    info = raster_validation or {}
+    valid = int(info.get("valid", 0) or 0)
+    if valid and "positive_values_are_lowering" in info:
+        lowering = int(info.get("positive" if info["positive_values_are_lowering"] else "negative", 0))
+        share = 100.0 * lowering / valid
+        log(
+            f"Raster check: {share:.0f}% of valid pixels will be read as seabed "
+            "lowering with the current sign settings."
+        )
+        if share < 20.0:
+            warnings.append(
+                f"Only {share:.0f}% of raster pixels will be read as lowering. "
+                "Check the raster value convention and lowering sign."
+            )
+
+    for warning in warnings:
+        log("PRE-RUN CHECK: " + warning)
+    if not warnings:
+        log("Pre-run checks passed.")
+    return warnings
+
+
 def load_ems(
     settings: Settings,
     log: Callable[[str], None],
     area_grid: gpd.GeoDataFrame | None = None,
     *,
     spatial_first_experiment: bool | None = None,
+    cancel_event: threading.Event | None = None,
 ) -> gpd.GeoDataFrame:
     source = Path(settings.ems_source)
     if not source.exists():
@@ -1615,16 +1896,7 @@ def load_ems(
         )
         source_kind = "delimited"
 
-    profile_settings = {
-        "kind": source_kind,
-        "x": settings.ems_x_field,
-        "y": settings.ems_y_field,
-        "datetime": settings.ems_datetime_field,
-        "time": settings.ems_time_field,
-        "dredge": settings.ems_dredge_field,
-        "vessel": settings.ems_vessel_field,
-    }
-    profile = "validator:" + json.dumps(profile_settings, sort_keys=True)
+    profile = _ems_profile(settings, source_kind)
     profile_crs = "EPSG:4326" if source_kind == "delimited" else None
     database.sync_files(
         files,
@@ -1633,6 +1905,7 @@ def load_ems(
         log=log,
         bulk_parser=bulk_parser,
         profile_crs=profile_crs,
+        cancel_event=cancel_event,
     )
     log("EMS index synchronization complete; preparing the survey record query...")
     if source_kind == "delimited":
@@ -1729,6 +2002,7 @@ def load_ems(
         "exact_bounds_by_crs": bounds_by_crs,
         "seconds": seconds,
         "log": log,
+        "cancel_event": cancel_event,
     }
     log("Current pathway: date/dredge filters, vessel/time ordering, then sampling.")
     current_result = _query_sampled_ems(
@@ -4288,12 +4562,24 @@ def _run_validation_single(
 def run_validation(
     settings: Settings,
     callback: Optional[Callable[[str], None]] = None,
+    *,
+    cancel_event: threading.Event | None = None,
+    confirm: Optional[Callable[[list[str]], bool]] = None,
 ) -> pd.DataFrame:
-    """Validate at the selected resolution(s), loading shared inputs once."""
+    """Validate at the selected resolution(s), loading shared inputs once.
+
+    cancel_event stops the run at the next log message or EMS database step.
+    confirm receives pre-run check warnings and returns False to stop.
+    """
     settings.validate()
 
-    def log(text: str) -> None:
+    def checked_callback(text: str) -> None:
+        if cancel_event is not None and cancel_event.is_set():
+            raise RunCancelled("Run cancelled by user.")
         notify(callback, text)
+
+    def log(text: str) -> None:
+        checked_callback(text)
 
     output_folder = Path(settings.output_folder)
     log(f"{APP_NAME} v{VERSION}")
@@ -4429,6 +4715,45 @@ def run_validation(
         settings.licence_layer_name,
         bbox=licence_bbox,
     )
+    wanted = selected_licences(settings)
+    if wanted:
+        licence_column = field_lookup(licences.columns, settings.licence_field)
+        licence_ids = licences[licence_column].astype(str).str.strip()
+        unknown = sorted(set(wanted) - set(licence_ids))
+        licences = licences.loc[licence_ids.isin(wanted)].copy()
+        if licences.empty:
+            raise ValueError(
+                "None of the selected licences were found in the licence layer"
+                + (" within the survey raster extent" if licence_bbox else "")
+                + f": {', '.join(wanted)}."
+            )
+        if unknown:
+            log(f"WARNING: selected licences not found and skipped: {', '.join(unknown)}")
+        selection = licences.to_crs(master_grid.crs).geometry
+        selection_area = (
+            selection.union_all() if hasattr(selection, "union_all") else selection.unary_union
+        )
+        in_selection = master_grid.geometry.representative_point().within(selection_area)
+        master_grid = master_grid.loc[in_selection].copy()
+        if master_grid.empty:
+            raise ValueError("No grid cells fall inside the selected licences.")
+        log(
+            f"Running {len(licences):,} selected licence(s) "
+            f"({', '.join(sorted(set(licences[licence_column].astype(str))))}) "
+            f"with {len(master_grid):,} grid cells."
+        )
+
+    warnings = preflight_checks(
+        settings,
+        master_grid,
+        licences,
+        grid_id_column,
+        raster_validation,
+        log,
+        check_ems_months=find_ems_cache(settings, master_grid) is None,
+    )
+    if warnings and confirm is not None and not confirm(warnings):
+        raise RunCancelled("Run stopped after pre-run checks.")
 
     if settings.resolution_mode in {RESOLUTION_50, RESOLUTION_BOTH}:
         log(
@@ -4479,7 +4804,7 @@ def run_validation(
         )
 
     log("Loading and sampling EMS records once for the survey/grid overlap...")
-    ems = load_ems(settings, log, master_grid)
+    ems = load_ems_cached(settings, log, master_grid, cancel_event=cancel_event)
 
     if settings.resolution_mode == RESOLUTION_250:
         resolutions = [(RESOLUTION_250, master_grid, "", 0.0)]
@@ -4508,7 +4833,7 @@ def run_validation(
         log(f"Running like-for-like validation at {resolution_label}...")
         summary = _run_validation_single(
             settings,
-            callback,
+            checked_callback,
             grid_override=grid,
             licences_override=licences,
             ems_override=ems,
@@ -4595,6 +4920,75 @@ def run_validation(
     return result
 
 
+RUN_STAGES = (
+    ("Validating bathymetric-difference raster", "Checking the difference raster..."),
+    ("Inspecting authoritative 250 m master-grid", "Loading and checking the grid..."),
+    ("Loading the authoritative 250 m master grid", "Loading the grid..."),
+    ("Running pre-run checks", "Running pre-run checks..."),
+    ("Generating aligned 50 m", "Building the 50 m grid..."),
+    ("Using saved EMS records", "Loading saved EMS records..."),
+    ("Opening the shared EMS index", "Opening the EMS database..."),
+    ("Discovering EMS files", "Scanning EMS files..."),
+    ("Repairing EMS vessel name", "Repairing vessel names (one-time)..."),
+    ("Starting indexed EMS query", "Querying EMS records (slowest step)..."),
+    ("Scanned ", "Querying EMS records (slowest step)..."),
+    ("Saved EMS records for reuse", "EMS records saved for next time..."),
+    ("Running like-for-like validation at", None),
+    ("Calculating bathymetric change statistics", "Calculating raster statistics..."),
+    ("Loading and spatially assigning EMS", "Assigning EMS records to cells..."),
+    ("Diagnostic table written", "Writing outputs..."),
+)
+
+
+def run_stage(text: str) -> str | None:
+    """Short progress label for a log message, or None to keep the current one."""
+    for prefix, stage in RUN_STAGES:
+        if text.startswith(prefix):
+            if stage is None:
+                return "Validating at " + text.split(" at ", 1)[1].rstrip(".") + "..."
+            return stage
+    return None
+
+
+def licence_choices(path: str, layer: str, field: str) -> list[str]:
+    """Sorted licence IDs from the licence layer, for the licence picker."""
+    info = pyogrio.read_info(path, layer=layer or None)
+    actual = field_lookup([str(name) for name in info["fields"]], field)
+    frame = pyogrio.read_dataframe(
+        path, layer=layer or None, columns=[actual], read_geometry=False
+    )
+    values = sorted({str(value).strip() for value in frame[actual].dropna()})
+    return [value for value in values if value]
+
+
+def _format_result_value(key: str, value: object) -> str:
+    if value is None or (isinstance(value, float) and not math.isfinite(value)):
+        return "-"
+    if key in {"ValidatedRate_tph", "UncorrectedRate_tph", "RegressionRate_tph", "AcceptedEMS_Hours"}:
+        return f"{float(value):,.0f}"
+    if key == "Background_m":
+        return f"{float(value):.3f}"
+    return str(value)
+
+
+def _open_path(path: Path) -> None:
+    if not path.exists():
+        messagebox.showerror(APP_NAME, f"Not found: {path}")
+        return
+    if sys.platform.startswith("win"):
+        os.startfile(str(path))  # type: ignore[attr-defined]
+    else:
+        subprocess.Popen(["open" if sys.platform == "darwin" else "xdg-open", str(path)])
+
+
+def _open_newest(folder: Path, pattern: str) -> None:
+    matches = sorted(folder.glob(pattern), key=lambda item: item.stat().st_mtime)
+    if not matches:
+        messagebox.showerror(APP_NAME, f"No {pattern} file found in {folder}")
+        return
+    _open_path(matches[-1])
+
+
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
@@ -4604,6 +4998,11 @@ class App(tk.Tk):
         self.vars = {}
         self._run_messages = None
         self._run_thread = None
+        self._cancel_event = None
+        self._run_started = None
+        self._warning_count = 0
+        self._last_summary = None
+        self._last_output = None
         self.run_button = None
         self._build()
 
@@ -4818,6 +5217,18 @@ class App(tk.Tk):
         ttk.Label(fields, text="Licence rate method").grid(row=22, column=0, sticky="w", padx=6, pady=3)
         self.vars["rate_method"] = tk.StringVar(value="POOLED")
         ttk.Combobox(fields, textvariable=self.vars["rate_method"], values=["POOLED", "CELL_FILTERS"], state="readonly").grid(row=22, column=1, sticky="ew", padx=6)
+        ttk.Label(fields, text="Licences to run (blank = all)").grid(row=23, column=0, sticky="w", padx=6, pady=3)
+        self.vars["licence_filter"] = tk.StringVar(value="")
+        ttk.Entry(fields, textvariable=self.vars["licence_filter"]).grid(row=23, column=1, sticky="ew", padx=6)
+        ttk.Button(fields, text="Choose...", command=self.choose_licences).grid(row=23, column=2, padx=4)
+        self.vars["reuse_ems_cache"] = tk.StringVar(value="True")
+        ttk.Checkbutton(
+            fields,
+            text="Reuse EMS data from an earlier run when EMS settings and dates match (much faster)",
+            variable=self.vars["reuse_ems_cache"],
+            onvalue="True",
+            offvalue="False",
+        ).grid(row=24, column=0, columnspan=3, sticky="w", padx=6, pady=3)
 
         qa = ttk.LabelFrame(body, text="3. Calculation and QA settings")
         qa.grid(row=2, column=0, sticky="ew", padx=10, pady=8)
@@ -4835,11 +5246,24 @@ class App(tk.Tk):
         action.grid(row=3, column=0, sticky="ew", padx=10, pady=8)
         self.run_button = ttk.Button(action, text="Run validation", command=self.run)
         self.run_button.pack(side="left")
+        self.cancel_button = ttk.Button(action, text="Cancel", command=self.cancel_run, state="disabled")
+        self.cancel_button.pack(side="left", padx=8)
         ttk.Button(action, text="Save settings", command=self.save_settings).pack(side="left", padx=8)
         ttk.Button(action, text="Load settings", command=self.load_settings).pack(side="left")
+        ttk.Button(action, text="Show last results", command=self.show_last_results).pack(side="left", padx=8)
+
+        status = ttk.Frame(body)
+        status.grid(row=4, column=0, sticky="ew", padx=10, pady=(0, 4))
+        status.columnconfigure(1, weight=1)
+        self.stage_label = ttk.Label(status, text="Ready.")
+        self.stage_label.grid(row=0, column=0, sticky="w")
+        self.progress = ttk.Progressbar(status, mode="indeterminate")
+        self.progress.grid(row=0, column=1, sticky="ew", padx=10)
+        self.elapsed_label = ttk.Label(status, text="")
+        self.elapsed_label.grid(row=0, column=2, sticky="e")
 
         log_frame = ttk.LabelFrame(body, text="Processing log")
-        log_frame.grid(row=4, column=0, sticky="nsew", padx=10, pady=8)
+        log_frame.grid(row=5, column=0, sticky="nsew", padx=10, pady=8)
         self.logbox = tk.Text(log_frame, height=12, wrap="word")
         self.logbox.pack(fill="both", expand=True, padx=6, pady=6)
 
@@ -4855,6 +5279,7 @@ class App(tk.Tk):
             if key in data and data[key] != "":
                 data[key] = float(data[key])
         data["write_model_factors"] = data.get("write_model_factors") == "True"
+        data["reuse_ems_cache"] = data.get("reuse_ems_cache", "True") == "True"
         required = ["calibration_grid", "licence_layer", "ems_source", "output_folder"]
         missing = [k for k in required if not data.get(k)]
         if missing:
@@ -4878,16 +5303,143 @@ class App(tk.Tk):
             return
 
         self._run_messages = queue.Queue()
+        self._cancel_event = threading.Event()
+        self._warning_count = 0
+        self._last_output = settings.output_folder
+        self._run_started = time.monotonic()
 
         self.run_button.configure(state="disabled", text="Running...")
+        self.cancel_button.configure(state="normal", text="Cancel")
+        self.stage_label.configure(text="Starting...")
+        self.progress.start(15)
+        self._tick_elapsed()
         self._run_thread = threading.Thread(
             target=_run_validation_worker,
-            args=(settings, self._run_messages),
+            args=(settings, self._run_messages, self._cancel_event),
             name="validator-run",
             daemon=True,
         )
         self._run_thread.start()
         self.after(100, self._poll_run_messages)
+
+    def cancel_run(self):
+        if self._cancel_event is not None and not self._cancel_event.is_set():
+            self._cancel_event.set()
+            self.cancel_button.configure(state="disabled", text="Cancelling...")
+            self.stage_label.configure(text="Cancelling at the next safe point...")
+
+    def _tick_elapsed(self):
+        if self._run_started is None:
+            return
+        seconds = int(time.monotonic() - self._run_started)
+        self.elapsed_label.configure(
+            text=f"Elapsed {seconds // 3600:d}:{seconds % 3600 // 60:02d}:{seconds % 60:02d}"
+        )
+        self.after(1000, self._tick_elapsed)
+
+    def _finish_run(self, stage_text):
+        self.progress.stop()
+        self._run_started = None
+        self.run_button.configure(state="normal", text="Run validation")
+        self.cancel_button.configure(state="disabled", text="Cancel")
+        self.stage_label.configure(text=stage_text)
+
+    def choose_licences(self):
+        path = self.vars["licence_layer"].get().strip()
+        if not path:
+            messagebox.showerror(APP_NAME, "Select the licence polygons first.", parent=self)
+            return
+        try:
+            values = licence_choices(
+                path,
+                self.vars["licence_layer_name"].get().strip(),
+                self.vars["licence_field"].get().strip(),
+            )
+        except Exception as exc:
+            messagebox.showerror(APP_NAME, str(exc), parent=self)
+            return
+        dialog = tk.Toplevel(self)
+        dialog.title("Choose licences to run")
+        dialog.transient(self)
+        ttk.Label(dialog, text="Select one or more licences (Ctrl/Shift-click). None selected = all.").pack(padx=12, pady=(12, 6), anchor="w")
+        frame = ttk.Frame(dialog)
+        frame.pack(fill="both", expand=True, padx=12)
+        listbox = tk.Listbox(frame, selectmode="extended", height=min(20, max(5, len(values))), exportselection=False)
+        scrollbar = ttk.Scrollbar(frame, orient="vertical", command=listbox.yview)
+        listbox.configure(yscrollcommand=scrollbar.set)
+        listbox.pack(side="left", fill="both", expand=True)
+        scrollbar.pack(side="right", fill="y")
+        current = set(selected_licences(Settings(difference_raster="", calibration_grid="", licence_layer="", ems_source="", output_folder="", licence_filter=self.vars["licence_filter"].get())))
+        for position, value in enumerate(values):
+            listbox.insert("end", value)
+            if value in current:
+                listbox.selection_set(position)
+        buttons = ttk.Frame(dialog)
+        buttons.pack(fill="x", padx=12, pady=12)
+
+        def apply():
+            chosen = [values[i] for i in listbox.curselection()]
+            self.vars["licence_filter"].set("" if len(chosen) in (0, len(values)) else ", ".join(chosen))
+            dialog.destroy()
+
+        ttk.Button(buttons, text="Select all", command=lambda: listbox.selection_set(0, "end")).pack(side="left")
+        ttk.Button(buttons, text="Clear", command=lambda: listbox.selection_clear(0, "end")).pack(side="left", padx=6)
+        ttk.Button(buttons, text="Cancel", command=dialog.destroy).pack(side="right")
+        ttk.Button(buttons, text="OK", command=apply).pack(side="right", padx=6)
+        dialog.grab_set()
+
+    def show_last_results(self):
+        if self._last_summary is None:
+            messagebox.showinfo(APP_NAME, "No results yet in this session.", parent=self)
+            return
+        self._show_results(self._last_summary)
+
+    def _show_results(self, summary):
+        window = tk.Toplevel(self)
+        window.title("Validation results")
+        window.geometry("1100x380")
+        columns = [
+            ("Resolution", "Resolution", 120),
+            ("LicenceNo", "Licence", 80),
+            ("ValidatedRate_tph", "Validated t/h", 100),
+            ("UncorrectedRate_tph", "No background t/h", 120),
+            ("RegressionRate_tph", "Regression t/h", 100),
+            ("Background_m", "Background m", 95),
+            ("BackgroundCells", "Bkg cells", 70),
+            ("AcceptedCells", "Cells used", 75),
+            ("AcceptedEMS_Hours", "EMS hours", 80),
+            ("QA_Status", "vs configured", 105),
+        ]
+        columns = [item for item in columns if item[0] in summary.columns]
+        if self._warning_count:
+            ttk.Label(
+                window,
+                text=f"{self._warning_count} warning(s) in the processing log - review them before using these rates.",
+                foreground="#9a5b00",
+            ).pack(anchor="w", padx=10, pady=(10, 0))
+        tree = ttk.Treeview(window, columns=[c[0] for c in columns], show="headings", height=10)
+        for key, heading, width in columns:
+            tree.heading(key, text=heading)
+            tree.column(key, width=width, anchor="e" if key not in {"Resolution", "LicenceNo", "QA_Status"} else "w")
+        colours = {"GREEN": "#d9f2d9", "AMBER": "#fff0c2", "RED": "#f8d0d0", "INSUFFICIENT_DATA": "#e6e6e6"}
+        for status, colour in colours.items():
+            tree.tag_configure(status, background=colour)
+        for row in summary.to_dict(orient="records"):
+            tree.insert("", "end", values=[_format_result_value(key, row.get(key)) for key, _, _ in columns], tags=(str(row.get("QA_Status", "")),))
+        tree.pack(fill="both", expand=True, padx=10, pady=10)
+        ttk.Label(
+            window,
+            text="'vs configured' compares the validated rate with the configured EMS rate. "
+            "Validated and regression rates close together suggest a reliable background correction.",
+            wraplength=1060,
+        ).pack(anchor="w", padx=10)
+        buttons = ttk.Frame(window)
+        buttons.pack(fill="x", padx=10, pady=10)
+        output = Path(self._last_output or ".")
+        ttk.Button(buttons, text="Open output folder", command=lambda: _open_path(output)).pack(side="left")
+        ttk.Button(buttons, text="Open summary CSV", command=lambda: _open_newest(output, "lowering_factor_validation_summary*.csv")).pack(side="left", padx=6)
+        ttk.Button(buttons, text="Open processing log", command=lambda: _open_newest(output, "processing_log*.txt")).pack(side="left")
+        ttk.Button(buttons, text="Close", command=window.destroy).pack(side="right")
 
     def _show_database_unavailable_dialog(
         self, error: EMSDatabaseUnavailableError
@@ -4968,12 +5520,32 @@ class App(tk.Tk):
 
             kind = message[0]
             if kind == "log":
+                text = message[1]
+                self.log(text)
+                if "WARNING" in text or text.startswith("PRE-RUN CHECK"):
+                    self._warning_count += 1
+                stage = run_stage(text)
+                if stage:
+                    self.stage_label.configure(text=stage)
+            elif kind == "confirm":
+                _, warnings, reply, done = message
+                reply["ok"] = messagebox.askyesno(
+                    "Pre-run checks",
+                    "The pre-run checks found:\n\n"
+                    + "\n\n".join(f"- {warning}" for warning in warnings)
+                    + "\n\nContinue with the run anyway?",
+                    parent=self,
+                )
+                done.set()
+            elif kind == "cancelled":
                 self.log(message[1])
+                self._finish_run(message[1])
+                finished = True
             elif kind == "error":
                 _, exc, traceback_text = message
                 self.log("ERROR: " + str(exc))
                 self.log(traceback_text)
-                self.run_button.configure(state="normal", text="Run validation")
+                self._finish_run("Stopped with an error - see the log.")
                 if isinstance(exc, EMSDatabaseUnavailableError):
                     self._show_database_unavailable_dialog(exc)
                 else:
@@ -4984,12 +5556,9 @@ class App(tk.Tk):
                 display_columns = ["LicenceNo", "ValidatedRate_tph", "QA_Status"]
                 if "Resolution" in summary.columns:
                     display_columns.insert(0, "Resolution")
-                self.run_button.configure(state="normal", text="Run validation")
-                messagebox.showinfo(
-                    APP_NAME,
-                    "Validation complete.\n\n"
-                    + summary[display_columns].to_string(index=False),
-                )
+                self._finish_run("Complete.")
+                self._last_summary = summary
+                self._show_results(summary)
                 finished = True
 
         if finished:
@@ -5000,7 +5569,7 @@ class App(tk.Tk):
         else:
             self._run_messages = None
             self._run_thread = None
-            self.run_button.configure(state="normal", text="Run validation")
+            self._finish_run("Ready.")
 
     def save_settings(self):
         try:
@@ -5025,14 +5594,30 @@ class App(tk.Tk):
             messagebox.showerror(APP_NAME, str(exc))
 
 
-def _run_validation_worker(settings: Settings, messages) -> None:
+def _run_validation_worker(settings: Settings, messages, cancel_event=None) -> None:
+    def confirm(warnings: list[str]) -> bool:
+        reply = {"ok": False}
+        done = threading.Event()
+        messages.put(("confirm", warnings, reply, done))
+        while not done.wait(0.2):
+            if cancel_event is not None and cancel_event.is_set():
+                return False
+        return bool(reply["ok"])
+
     try:
         summary = run_validation(
             settings,
             lambda text: messages.put(("log", text)),
+            cancel_event=cancel_event,
+            confirm=confirm,
         )
+    except RunCancelled as exc:
+        messages.put(("cancelled", str(exc)))
     except Exception as exc:
-        messages.put(("error", exc, traceback.format_exc()))
+        if cancel_event is not None and cancel_event.is_set():
+            messages.put(("cancelled", "Run cancelled by user."))
+        else:
+            messages.put(("error", exc, traceback.format_exc()))
     else:
         messages.put(("complete", summary))
 
