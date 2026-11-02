@@ -351,6 +351,15 @@ LIMITATIONS IN VERSION 1.0
 
 LOWERING MODEL FACTOR UPDATE
 ----------------------------
+Updating factors later: tick "Replace existing factors for the licences in
+this run" (command line --replace-model-factors). Only the licences in that run
+are changed; the app lists each old -> new factor and asks before replacing
+(answering No still fills blank factors). Every fill and replacement is
+recorded in the model's lowering_factor_history table (date, area, old and new
+factor, validated m3/h, background, cells, hours, survey dates, rate method,
+output folder), so earlier factors can be restored. All changes in a run are
+written in one transaction.
+
 Write-back is OFF by default. Switch on "Fill blank lowering_factor values"
 in the GUI, set "write_model_factors": true in a settings file, or pass
 --write-model-factors on the command line. Review the results first: a filled

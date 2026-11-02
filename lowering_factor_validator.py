@@ -139,6 +139,7 @@ class Settings:
     model_path: str = ""
     model_layer: str = "areas"
     model_id_field: str = "area_id"
+    replace_model_factors: bool = False
 
     @classmethod
     def from_dict(cls, data: dict) -> "Settings":
@@ -253,6 +254,8 @@ class Settings:
             raise ValueError("reuse_ems_cache must be true or false.")
         if not isinstance(self.licence_filter, str):
             raise ValueError("licence_filter must be text, e.g. '137, 522'.")
+        if not isinstance(self.replace_model_factors, bool):
+            raise ValueError("replace_model_factors must be true or false.")
         if self.write_model_factors and self.model_path.strip():
             if not Path(self.model_path).is_file():
                 raise ValueError(f"Model to update was not found: {self.model_path}")
@@ -350,6 +353,14 @@ def parse_cli_settings(argv: Optional[list[str]] = None) -> Settings:
         "(default: the licence layer itself).",
     )
     parser.add_argument("--model-layer", default=None, help="Model layer (default: areas).")
+    parser.add_argument(
+        "--replace-model-factors",
+        action="store_const",
+        const=True,
+        default=None,
+        help="With --write-model-factors, also replace existing factors for the "
+        "licences in this run (recorded in lowering_factor_history).",
+    )
     parser.add_argument(
         "--model-id-field", default=None, help="Model area ID field (default: area_id)."
     )
@@ -478,6 +489,7 @@ def parse_cli_settings(argv: Optional[list[str]] = None) -> Settings:
         "model_path": args.model_path,
         "model_layer": args.model_layer,
         "model_id_field": args.model_id_field,
+        "replace_model_factors": args.replace_model_factors,
     }
     for field_name, value in cli_overrides.items():
         if value is not None:
@@ -703,17 +715,72 @@ def _quote_sqlite_identifier(identifier: str) -> str:
     return '"' + identifier.replace('"', '""') + '"'
 
 
+HISTORY_TABLE = "lowering_factor_history"
+
+
+def _factor_is_blank(value: object) -> bool:
+    return value is None or not str(value).strip()
+
+
+def _ensure_history_table(connection: sqlite3.Connection) -> None:
+    """Create the write-back history table, registered so GIS shows it."""
+    connection.execute(
+        f"""CREATE TABLE IF NOT EXISTS {HISTORY_TABLE} (
+            fid INTEGER PRIMARY KEY AUTOINCREMENT,
+            written_at TEXT NOT NULL,
+            layer TEXT NOT NULL,
+            area_id TEXT NOT NULL,
+            old_factor REAL,
+            new_factor REAL NOT NULL,
+            action TEXT NOT NULL,
+            validated_rate_m3ph REAL,
+            background_m REAL,
+            accepted_cells INTEGER,
+            accepted_ems_hours REAL,
+            survey_start TEXT,
+            survey_end TEXT,
+            rate_method TEXT,
+            output_folder TEXT,
+            app_version TEXT
+        )"""
+    )
+    has_contents = connection.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'gpkg_contents'"
+    ).fetchone()
+    if has_contents:
+        connection.execute(
+            "INSERT OR IGNORE INTO gpkg_contents "
+            "(table_name, data_type, identifier, description, last_change) "
+            "VALUES (?, 'attributes', ?, ?, strftime('%Y-%m-%dT%H:%M:%fZ','now'))",
+            (
+                HISTORY_TABLE,
+                HISTORY_TABLE,
+                "Lowering factors written by the Lowering Factor Validator",
+            ),
+        )
+
+
 def update_model_lowering_factors(
     model_path: str,
     layer_name: str,
     area_id_field: str,
     summary: pd.DataFrame,
     log: Callable[[str], None],
+    *,
+    replace: bool = False,
+    confirm_replace: Optional[Callable[[list[str]], bool]] = None,
+    run_info: Optional[dict] = None,
 ) -> int:
-    """Fill blank model area factors from validated 250 m rates, without overwriting."""
+    """Write validated 250 m rates to model area factors (m/hour per 250 m cell).
+
+    Blank factors are always filled. Existing factors are only replaced when
+    replace is True, and then only after confirm_replace (when given) approves
+    the listed changes. Every write is recorded in lowering_factor_history and
+    all changes happen in one transaction.
+    """
     path = Path(model_path)
     if path.suffix.lower() != ".gpkg":
-        log("Source-model factor update skipped: the selected licence source is not a GeoPackage.")
+        log("Source-model factor update skipped: the selected target is not a GeoPackage.")
         return 0
 
     selected_layer = layer_name or None
@@ -743,100 +810,169 @@ def update_model_lowering_factors(
     quoted_layer = _quote_sqlite_identifier(actual_layer)
     quoted_id = _quote_sqlite_identifier(actual_id_field)
     quoted_factor = _quote_sqlite_identifier(factor_field)
-    rate_by_area: dict[str, float] = {}
-    for row in summary.itertuples(index=False):
-        rate = pd.to_numeric(
-            pd.Series([getattr(row, "ValidatedRate_m3ph")]), errors="coerce"
-        ).iloc[0]
+    candidates: dict[str, dict[str, object]] = {}
+    for row in summary.to_dict(orient="records"):
+        rate = pd.to_numeric(pd.Series([row.get("ValidatedRate_m3ph")]), errors="coerce").iloc[0]
         if pd.isna(rate) or not np.isfinite(rate) or rate <= 0:
             continue
-        area_id = str(getattr(row, "LicenceNo")).strip()
-        if area_id in rate_by_area:
+        area_id = str(row.get("LicenceNo")).strip()
+        if area_id in candidates:
             raise ValueError(
                 f"More than one validation rate was produced for model area {area_id!r}."
             )
-        rate_by_area[area_id] = float(rate) / (250.0 * 250.0)
+        candidates[area_id] = {"factor": float(rate) / (250.0 * 250.0), "row": row}
 
-    if not rate_by_area:
+    if not candidates:
         log("Source-model factor update skipped: no valid positive 250 m validation rates were produced.")
         return 0
 
-    updated = 0
-    unmatched = set(rate_by_area)
+    # Plan the changes from a read, so the user can confirm before anything is locked.
     connection = sqlite3.connect(path, timeout=30)
     try:
-        connection.execute("PRAGMA busy_timeout = 30000")
-        connection.execute("BEGIN IMMEDIATE")
-        triggers = connection.execute(
-            "SELECT name, sql FROM sqlite_master "
-            "WHERE type = 'trigger' AND tbl_name = ? AND lower(name) LIKE ?",
-            (actual_layer, f"rtree_{actual_layer.casefold()}_%"),
-        ).fetchall()
-        for trigger_name, _ in triggers:
-            connection.execute(
-                f"DROP TRIGGER {_quote_sqlite_identifier(trigger_name)}"
-            )
-
         rows = connection.execute(
             f"SELECT CAST({quoted_id} AS TEXT), {quoted_factor} FROM {quoted_layer}"
         ).fetchall()
-        seen_ids = set()
-        duplicate_ids = set()
-        for row in rows:
-            area_id = row[0]
-            if area_id is not None and area_id in seen_ids:
-                duplicate_ids.add(area_id)
-            if area_id is not None:
-                seen_ids.add(area_id)
-        duplicate_ids = sorted(duplicate_ids)
-        if duplicate_ids:
-            raise ValueError(
-                f"Cannot update model factors because layer '{actual_layer}' "
-                f"contains duplicate area IDs: {', '.join(duplicate_ids[:10])}."
-            )
-
-        for area_id, factor in rate_by_area.items():
-            matched = connection.execute(
-                f"SELECT {quoted_factor} FROM {quoted_layer} "
-                f"WHERE CAST({quoted_id} AS TEXT) = ?",
-                (area_id,),
-            ).fetchall()
-            if not matched:
-                continue
-            unmatched.discard(area_id)
-            if len(matched) != 1:
-                raise ValueError(
-                    f"Expected one row for area ID {area_id!r} in layer '{actual_layer}', "
-                    f"found {len(matched)}."
-                )
-            if matched[0][0] is not None and str(matched[0][0]).strip():
-                continue
-            connection.execute(
-                f"UPDATE {quoted_layer} SET {quoted_factor} = ? "
-                f"WHERE CAST({quoted_id} AS TEXT) = ? "
-                f"AND ({quoted_factor} IS NULL OR TRIM(CAST({quoted_factor} AS TEXT)) = '')",
-                (factor, area_id),
-            )
-            updated += connection.execute("SELECT changes()").fetchone()[0]
-        for _, trigger_sql in triggers:
-            connection.execute(trigger_sql)
-        connection.commit()
-    except Exception:
-        connection.rollback()
-        raise
     finally:
         connection.close()
+    current: dict[str, list[object]] = {}
+    for area_id, value in rows:
+        if area_id is not None:
+            current.setdefault(area_id, []).append(value)
+    duplicates = sorted(key for key, values in current.items() if len(values) > 1)
+    if duplicates:
+        raise ValueError(
+            f"Cannot update model factors because layer '{actual_layer}' "
+            f"contains duplicate area IDs: {', '.join(duplicates[:10])}."
+        )
+
+    fills, replacements, kept = [], [], []
+    unmatched = sorted(set(candidates) - set(current))
+    for area_id, item in sorted(candidates.items()):
+        if area_id not in current:
+            continue
+        old = current[area_id][0]
+        new = item["factor"]
+        if _factor_is_blank(old):
+            fills.append((area_id, None, new))
+        elif not replace:
+            kept.append((area_id, old, new))
+        elif not math.isclose(float(old), new, rel_tol=1e-12, abs_tol=0.0):
+            replacements.append((area_id, float(old), new))
+
+    for area_id, old, new in kept:
+        log(
+            f"Model area {area_id}: kept existing lowering_factor {old} "
+            f"(validated {new:.6f}); tick 'Replace existing factors' to update it."
+        )
+    if replacements and confirm_replace is not None:
+        lines = [
+            f"Area {area_id}: {old:.6f} -> {new:.6f} m/hour ({(new - old) / old * 100.0:+.1f}%)"
+            if old else f"Area {area_id}: {old} -> {new:.6f} m/hour"
+            for area_id, old, new in replacements
+        ]
+        if not confirm_replace(lines):
+            log("Replacing existing lowering factors was declined; only blank values will be filled.")
+            replacements = []
+
+    changes = [(area_id, old, new, "filled") for area_id, old, new in fills] + [
+        (area_id, old, new, "replaced") for area_id, old, new in replacements
+    ]
+    written_at = datetime.now().astimezone().isoformat(timespec="seconds")
+    info_values = run_info or {}
+    filled = replaced = 0
+    if changes:
+        connection = sqlite3.connect(path, timeout=30)
+        try:
+            connection.execute("PRAGMA busy_timeout = 30000")
+            connection.execute("BEGIN IMMEDIATE")
+            triggers = connection.execute(
+                "SELECT name, sql FROM sqlite_master "
+                "WHERE type = 'trigger' AND tbl_name = ? AND lower(name) LIKE ?",
+                (actual_layer, f"rtree_{actual_layer.casefold()}_%"),
+            ).fetchall()
+            for trigger_name, _ in triggers:
+                connection.execute(f"DROP TRIGGER {_quote_sqlite_identifier(trigger_name)}")
+            _ensure_history_table(connection)
+            for area_id, old, new, action in changes:
+                if action == "filled":
+                    condition = f"({quoted_factor} IS NULL OR TRIM(CAST({quoted_factor} AS TEXT)) = '')"
+                    parameters: tuple = (new, area_id)
+                else:
+                    condition = f"{quoted_factor} = ?"
+                    parameters = (new, area_id, old)
+                connection.execute(
+                    f"UPDATE {quoted_layer} SET {quoted_factor} = ? "
+                    f"WHERE CAST({quoted_id} AS TEXT) = ? AND {condition}",
+                    parameters,
+                )
+                if connection.execute("SELECT changes()").fetchone()[0] != 1:
+                    raise RuntimeError(
+                        f"Model area {area_id} changed while the update was being "
+                        "confirmed; nothing was written. Run again."
+                    )
+                row = candidates[area_id]["row"]
+                connection.execute(
+                    f"INSERT INTO {HISTORY_TABLE} (written_at, layer, area_id, old_factor, "
+                    "new_factor, action, validated_rate_m3ph, background_m, accepted_cells, "
+                    "accepted_ems_hours, survey_start, survey_end, rate_method, "
+                    "output_folder, app_version) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        written_at, actual_layer, area_id,
+                        None if old is None else float(old), new, action,
+                        _optional_float(row.get("ValidatedRate_m3ph")),
+                        _optional_float(row.get("Background_m")),
+                        _optional_int(row.get("AcceptedCells")),
+                        _optional_float(row.get("AcceptedEMS_Hours")),
+                        info_values.get("survey_start"), info_values.get("survey_end"),
+                        info_values.get("rate_method"), info_values.get("output_folder"),
+                        f"{APP_NAME} v{VERSION}",
+                    ),
+                )
+                if action == "filled":
+                    filled += 1
+                else:
+                    replaced += 1
+                log(
+                    f"Model area {area_id}: lowering_factor "
+                    + ("filled" if action == "filled" else f"replaced {old:.6f} ->")
+                    + f" {new:.6f} m/hour."
+                )
+            for _, trigger_sql in triggers:
+                connection.execute(trigger_sql)
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
 
     if unmatched:
         log(
             "No source-model area matched these validation IDs: "
-            + ", ".join(sorted(unmatched)[:20])
+            + ", ".join(unmatched[:20])
         )
-    log(
-        f"Updated {updated:,} blank lowering_factor value(s) in "
-        f"{path.name} | {actual_layer}; existing nonblank values were preserved."
-    )
-    return updated
+    if replaced:
+        log(
+            f"Updated {filled:,} blank and replaced {replaced:,} existing lowering_factor "
+            f"value(s) in {path.name} | {actual_layer}; history recorded in {HISTORY_TABLE}."
+        )
+    else:
+        log(
+            f"Updated {filled:,} blank lowering_factor value(s) in "
+            f"{path.name} | {actual_layer}; existing nonblank values were preserved"
+            + (f"; history recorded in {HISTORY_TABLE}." if filled else ".")
+        )
+    return filled + replaced
+
+
+def _optional_float(value: object) -> float | None:
+    number = pd.to_numeric(pd.Series([value]), errors="coerce").iloc[0]
+    return None if pd.isna(number) or not np.isfinite(number) else float(number)
+
+
+def _optional_int(value: object) -> int | None:
+    number = _optional_float(value)
+    return None if number is None else int(round(number))
 
 
 def _iter_delimited_chunks(path: Path, *, include_read_time: bool = False):
@@ -4650,6 +4786,7 @@ def run_validation(
     *,
     cancel_event: threading.Event | None = None,
     confirm: Optional[Callable[[list[str]], bool]] = None,
+    confirm_replace: Optional[Callable[[list[str]], bool]] = None,
 ) -> pd.DataFrame:
     """Run a validation and save every message to run_log.txt in the output folder.
 
@@ -4665,7 +4802,11 @@ def run_validation(
     outcome = "COMPLETED"
     try:
         return _run_validation(
-            settings, recording_callback, cancel_event=cancel_event, confirm=confirm
+            settings,
+            recording_callback,
+            cancel_event=cancel_event,
+            confirm=confirm,
+            confirm_replace=confirm_replace,
         )
     except RunCancelled as exc:
         outcome = f"CANCELLED: {exc}"
@@ -4708,6 +4849,7 @@ def _run_validation(
     *,
     cancel_event: threading.Event | None = None,
     confirm: Optional[Callable[[list[str]], bool]] = None,
+    confirm_replace: Optional[Callable[[list[str]], bool]] = None,
 ) -> pd.DataFrame:
     """Validate at the selected resolution(s), loading shared inputs once.
 
@@ -5058,7 +5200,21 @@ def _run_validation(
             f"Write-back target: {target} | layer {layer or '(default)'} | "
             f"matching LicenceNo to {id_field}."
         )
-        update_model_lowering_factors(target, layer, id_field, factor_summary, log)
+        update_model_lowering_factors(
+            target,
+            layer,
+            id_field,
+            factor_summary,
+            log,
+            replace=settings.replace_model_factors,
+            confirm_replace=confirm_replace,
+            run_info={
+                "survey_start": settings.survey_start,
+                "survey_end": settings.survey_end,
+                "rate_method": settings.rate_method,
+                "output_folder": settings.output_folder,
+            },
+        )
     return result
 
 
@@ -5419,6 +5575,15 @@ class App(tk.Tk):
             onvalue="True",
             offvalue="False",
         ).grid(row=0, column=0, columnspan=3, sticky="w", padx=6, pady=3)
+        self.vars["replace_model_factors"] = tk.StringVar(value="False")
+        ttk.Checkbutton(
+            writeback,
+            text="Replace existing factors for the licences in this run "
+            "(asks before replacing; every change is recorded in lowering_factor_history)",
+            variable=self.vars["replace_model_factors"],
+            onvalue="True",
+            offvalue="False",
+        ).grid(row=5, column=0, columnspan=3, sticky="w", padx=24, pady=3)
         ttk.Label(writeback, text="Model to update (write-back target)").grid(row=1, column=0, sticky="w", padx=6, pady=3)
         self.vars["model_path"] = tk.StringVar(value="")
         ttk.Entry(writeback, textvariable=self.vars["model_path"]).grid(row=1, column=1, sticky="ew", padx=6)
@@ -5488,6 +5653,7 @@ class App(tk.Tk):
                 data[key] = float(data[key])
         data["write_model_factors"] = data.get("write_model_factors") == "True"
         data["reuse_ems_cache"] = data.get("reuse_ems_cache", "True") == "True"
+        data["replace_model_factors"] = data.get("replace_model_factors") == "True"
         required = ["calibration_grid", "licence_layer", "ems_source", "output_folder"]
         missing = [k for k in required if not data.get(k)]
         if missing:
@@ -5736,12 +5902,14 @@ class App(tk.Tk):
                 if stage:
                     self.stage_label.configure(text=stage)
             elif kind == "confirm":
-                _, warnings, reply, done = message
+                _, title, intro, items, question, reply, done = message
                 reply["ok"] = messagebox.askyesno(
-                    "Pre-run checks",
-                    "The pre-run checks found:\n\n"
-                    + "\n\n".join(f"- {warning}" for warning in warnings)
-                    + "\n\nContinue with the run anyway?",
+                    title,
+                    intro
+                    + "\n\n"
+                    + "\n\n".join(f"- {item}" for item in items)
+                    + "\n\n"
+                    + question,
                     parent=self,
                 )
                 done.set()
@@ -5803,21 +5971,32 @@ class App(tk.Tk):
 
 
 def _run_validation_worker(settings: Settings, messages, cancel_event=None) -> None:
-    def confirm(warnings: list[str]) -> bool:
-        reply = {"ok": False}
-        done = threading.Event()
-        messages.put(("confirm", warnings, reply, done))
-        while not done.wait(0.2):
-            if cancel_event is not None and cancel_event.is_set():
-                return False
-        return bool(reply["ok"])
+    def ask(title: str, intro: str, question: str):
+        def confirm(items: list[str]) -> bool:
+            reply = {"ok": False}
+            done = threading.Event()
+            messages.put(("confirm", title, intro, items, question, reply, done))
+            while not done.wait(0.2):
+                if cancel_event is not None and cancel_event.is_set():
+                    return False
+            return bool(reply["ok"])
+        return confirm
 
     try:
         summary = run_validation(
             settings,
             lambda text: messages.put(("log", text)),
             cancel_event=cancel_event,
-            confirm=confirm,
+            confirm=ask(
+                "Pre-run checks",
+                "The pre-run checks found:",
+                "Continue with the run anyway?",
+            ),
+            confirm_replace=ask(
+                "Replace lowering factors",
+                "These existing lowering factors in the model will be replaced:",
+                "Replace them? (Choose No to keep them; blank factors are still filled.)",
+            ),
         )
     except RunCancelled as exc:
         messages.put(("cancelled", str(exc)))

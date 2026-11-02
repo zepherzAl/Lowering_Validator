@@ -364,6 +364,78 @@ class ModelWriteBackTargetTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "Model to update was not found"):
             settings.validate()
 
+    def _run(self, confirm_replace=None, **overrides):
+        settings = _settings(
+            self.root, analysis_extent="TRACK_FOOTPRINT", write_model_factors=True,
+            model_path=str(self.model), licence_layer="ADZ.gpkg", **overrides,
+        )
+        grid = _grid([("a", box(0, 0, 250, 250))])
+        licences = gpd.GeoDataFrame(
+            {"LicenceNo": ["137", "522"]},
+            geometry=[box(0, 0, 250, 250), box(250, 0, 500, 250)],
+            crs="EPSG:27700",
+        )
+        summary = pd.DataFrame({
+            "LicenceNo": ["137", "522"],
+            "ValidatedRate_m3ph": [1_057.0, 900.0],
+            "ValidatedRate_tph": [1_797.0, 1_530.0],
+            "QA_Status": ["RED", "RED"],
+            "Background_m": [0.081, 0.09],
+            "AcceptedCells": [44, 10],
+            "AcceptedEMS_Hours": [868.2, 100.0],
+        })
+        empty_ems = gpd.GeoDataFrame(
+            {"_datetime": []}, geometry=gpd.GeoSeries([], crs="EPSG:27700"), crs="EPSG:27700"
+        )
+        messages = []
+        with (
+            patch.object(validator, "prepare_difference_raster", return_value="d.tif"),
+            patch.object(validator, "validate_bathymetric_difference_raster", return_value={}),
+            patch.object(validator, "read_vector", side_effect=[grid, licences]),
+            patch.object(validator, "load_ems", return_value=empty_ems),
+            patch.object(validator, "_run_validation_single", return_value=summary),
+        ):
+            validator.run_validation(settings, messages.append, confirm_replace=confirm_replace)
+        areas = gpd.read_file(self.model, layer="areas").set_index("area_id")
+        history = pd.read_sql_query(
+            "SELECT * FROM lowering_factor_history ORDER BY fid", sqlite3.connect(self.model)
+        )
+        return areas, history, "\n".join(messages)
+
+    def test_replace_after_confirmation_updates_and_records_history(self):
+        shown = []
+        areas, history, text = self._run(
+            confirm_replace=lambda lines: shown.extend(lines) or True,
+            replace_model_factors=True,
+        )
+        self.assertAlmostEqual(areas.loc["137", "lowering_factor"], 1_057.0 / 62_500)
+        self.assertAlmostEqual(areas.loc["522", "lowering_factor"], 900.0 / 62_500)
+        self.assertEqual(shown, ["Area 522: 0.020000 -> 0.014400 m/hour (-28.0%)"])
+        self.assertEqual(history["action"].tolist(), ["filled", "replaced"])
+        replaced = history.iloc[1]
+        self.assertEqual(replaced["area_id"], "522")
+        self.assertAlmostEqual(replaced["old_factor"], 0.02)
+        self.assertAlmostEqual(replaced["new_factor"], 0.0144)
+        self.assertEqual(replaced["accepted_cells"], 10)
+        self.assertEqual(replaced["survey_start"], "01/05/2022")
+        self.assertIn("replaced 1 existing", text)
+        import pyogrio
+        self.assertIn("lowering_factor_history", [row[0] for row in pyogrio.list_layers(self.model)])
+
+    def test_declining_replacement_keeps_existing_and_still_fills_blank(self):
+        areas, history, text = self._run(
+            confirm_replace=lambda lines: False, replace_model_factors=True
+        )
+        self.assertAlmostEqual(areas.loc["522", "lowering_factor"], 0.02)
+        self.assertAlmostEqual(areas.loc["137", "lowering_factor"], 1_057.0 / 62_500)
+        self.assertEqual(history["action"].tolist(), ["filled"])
+        self.assertIn("declined", text)
+
+    def test_without_replace_option_existing_factor_is_kept_and_explained(self):
+        areas, _, text = self._run()
+        self.assertAlmostEqual(areas.loc["522", "lowering_factor"], 0.02)
+        self.assertIn("Model area 522: kept existing lowering_factor 0.02", text)
+
     def test_run_fills_blank_model_factor_and_keeps_existing_one(self):
         settings = _settings(
             self.root, analysis_extent="TRACK_FOOTPRINT", write_model_factors=True,
