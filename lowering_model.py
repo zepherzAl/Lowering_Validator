@@ -249,8 +249,9 @@ def validate_lowering_model(model: LoweringModel) -> ModelValidation:
             ]
             if not ambiguous_pairs.empty:
                 result.warnings.append(
-                    "Active area polygons overlap or touch; EMS points intersecting multiple "
-                    "areas will be marked ambiguous."
+                    "Active area polygons overlap or touch; EMS points inside more than one "
+                    "area are counted in every area they fall in (marked 'shared'). Do not "
+                    "add lowering or volume across areas where they overlap."
                 )
         except (ImportError, ValueError) as exc:
             result.warnings.append(f"Could not pre-check active area overlaps: {exc}")
@@ -274,7 +275,14 @@ def assign_points_to_areas(
     model: LoweringModel,
     validation: ModelValidation,
 ) -> gpd.GeoDataFrame:
-    """Assign each sampled point only when it intersects exactly one usable area."""
+    """Assign each sampled point to every usable area it falls in.
+
+    area_assignment is 'matched' (one area), 'shared' (inside two or more
+    overlapping areas; counted in each) or 'unmatched'. area_candidates lists
+    every area the point counts towards. area_id/area_name hold the single area
+    for matched points and are empty for shared points; use points_for_area()
+    to select an area's points.
+    """
     active = model.areas.loc[
         model.areas["active"].map(_boolean_value).eq(True),
         ["area_id", "area_name", "geometry"],
@@ -294,42 +302,32 @@ def assign_points_to_areas(
     if active.empty or assigned.empty:
         return assigned.drop(columns="_point_id")
 
-    exact_matches = gpd.sjoin(
+    matches = gpd.sjoin(
         assigned[["_point_id", "geometry"]],
         active,
         how="inner",
         predicate="intersects",
     )
-    near_points = assigned[["_point_id", "geometry"]].copy()
-    near_points.geometry = near_points.geometry.buffer(AREA_BOUNDARY_TOLERANCE_M)
-    near_matches = gpd.sjoin(
-        near_points,
-        active,
-        how="inner",
-        predicate="intersects",
-    )
-    exact_by_point = {
-        int(point_id): group
-        for point_id, group in exact_matches.groupby("_point_id")
-    }
-    near_by_point = {
-        int(point_id): set(group["area_id"].astype(str))
-        for point_id, group in near_matches.groupby("_point_id")
-    }
-    for point_id, group in exact_by_point.items():
-        exact_ids = set(group["area_id"].astype(str))
-        candidate_ids = near_by_point.get(point_id, exact_ids)
-        assigned.loc[point_id, "area_candidates"] = json.dumps(
-            sorted(candidate_ids)
-        )
-        if len(exact_ids) > 1 or (len(exact_ids) == 1 and len(candidate_ids) > 1):
-            assigned.loc[point_id, "area_assignment"] = "ambiguous"
+    for point_id, group in matches.groupby("_point_id"):
+        point_id = int(point_id)
+        area_ids = sorted(set(group["area_id"].astype(str)))
+        assigned.loc[point_id, "area_candidates"] = json.dumps(area_ids)
+        if len(area_ids) > 1:
+            assigned.loc[point_id, "area_assignment"] = "shared"
             continue
         match = group.iloc[0]
         assigned.loc[point_id, "area_id"] = match["area_id"]
         assigned.loc[point_id, "area_name"] = match["area_name"]
         assigned.loc[point_id, "area_assignment"] = "matched"
     return assigned.drop(columns="_point_id")
+
+
+def points_for_area(assigned: gpd.GeoDataFrame, area_key: str) -> gpd.GeoDataFrame:
+    """Every point that counts towards area_key: matched there or shared with it."""
+    key = str(area_key)
+    in_area = assigned["area_candidates"].map(lambda text: key in json.loads(text))
+    counted = assigned["area_assignment"].isin(["matched", "shared"]) & in_area
+    return assigned.loc[counted].copy()
 
 
 def lowering_model_summary(model: LoweringModel, validation: ModelValidation) -> str:

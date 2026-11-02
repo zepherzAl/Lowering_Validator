@@ -21,6 +21,7 @@ from resolution_grid import create_aligned_child_grid, inspect_master_grid
 from lowering_model import (
     assign_points_to_areas,
     load_lowering_model,
+    points_for_area,
     lowering_model_summary,
     validate_lowering_model,
 )
@@ -607,7 +608,8 @@ def update_multi_area_cumulative_grid(
         raise ValueError("Quarter area_id/grid_id keys must be unique.")
 
     update_columns = [
-        "point_count", "time_minutes", "time_hours", "volume_m3", "lowering_m"
+        "point_count", "time_minutes", "time_hours", "volume_m3", "lowering_m",
+        "shared_point_count", "shared_lowering_m",
     ]
     for column in update_columns:
         if column not in existing.columns:
@@ -673,6 +675,7 @@ def update_multi_area_cumulative_grid(
         columns=["_area_grid_key", "_existing_geometry", "_quarter_geometry"]
     )
     cumulative["point_count"] = cumulative["point_count"].round(0).astype(int)
+    cumulative["shared_point_count"] = cumulative["shared_point_count"].round(0).astype(int)
     for column in ("time_minutes", "time_hours", "volume_m3", "lowering_m"):
         cumulative[column] = cumulative[column].round(2)
     cumulative["calculated_lowering"] = cumulative["lowering_m"]
@@ -1117,34 +1120,33 @@ def run_lowering_workflow(
     points_gdf = create_points_layer(cleaned_points_df)
     assigned_points = assign_points_to_areas(points_gdf, model, validation)
     assigned_points_out = assigned_points.to_crs(INPUT_CRS)
-    ambiguous_count = int(assigned_points["area_assignment"].eq("ambiguous").sum())
+    shared_count = int(assigned_points["area_assignment"].eq("shared").sum())
     unmatched_count = int(assigned_points["area_assignment"].eq("unmatched").sum())
     if log_callback:
         log_callback(f"Sampled EMS records: {len(assigned_points):,}")
         log_callback(f"Unmatched records outside valid active areas: {unmatched_count:,}")
-        log_callback(f"Ambiguous records intersecting multiple areas: {ambiguous_count:,}")
+        log_callback(
+            f"Shared records inside overlapping areas (counted in each area): {shared_count:,}"
+        )
+        if shared_count:
+            log_callback(
+                "WARNING: overlapping areas share seabed. Each area's lowering is complete, "
+                "but adding lowering or volume across areas double-counts the cells "
+                "flagged with shared_point_count > 0."
+            )
 
     area_rows = []
     grid_outputs = {RESOLUTION_250: [], RESOLUTION_50: []}
     grid_summaries = {RESOLUTION_250: [], RESOLUTION_50: []}
-    areas_encountered = set(
-        assigned_points.loc[
-            assigned_points["area_assignment"].eq("matched"), "area_id"
-        ].dropna().astype(str)
-    )
+    areas_encountered = set()
     for candidates in assigned_points.loc[
-        assigned_points["area_assignment"].eq("ambiguous"), "area_candidates"
+        assigned_points["area_assignment"].isin(["matched", "shared"]), "area_candidates"
     ]:
         areas_encountered.update(json.loads(candidates))
     area_filter = set(validation.eligible_area_ids)
     if processing_mode == "Selected area":
         area_filter &= {str(selected_area_id)}
-    matched_area_ids = set(
-        assigned_points.loc[
-            assigned_points["area_assignment"].eq("matched"), "area_id"
-        ].dropna().astype(str)
-    )
-    affected_area_ids = matched_area_ids & area_filter
+    affected_area_ids = areas_encountered & area_filter
 
     if resolution_mode in {RESOLUTION_50, RESOLUTION_BOTH}:
         for area_key in sorted(affected_area_ids):
@@ -1192,10 +1194,8 @@ def run_lowering_workflow(
         area = model.areas.loc[model.areas["area_id"].astype(str).eq(area_key)].iloc[0]
         area_name = str(area["area_name"])
         calibrated_factor = float(area["lowering_factor"])
-        area_points = assigned_points.loc[
-            assigned_points["area_assignment"].eq("matched")
-            & assigned_points["area_id"].astype(str).eq(area_key)
-        ].copy()
+        area_points = points_for_area(assigned_points, area_key)
+        area_shared = int(area_points["area_assignment"].eq("shared").sum())
         area_row = {
             "summary_scope": "area",
             "area_id": area["area_id"],
@@ -1206,13 +1206,7 @@ def run_lowering_workflow(
             "ems_records_tracks_processed": len(area_points),
             "ems_records_tracks_assigned": len(area_points),
             "unmatched_ems_records_tracks": 0,
-            "ambiguous_boundary_records": sum(
-                area_key in json.loads(candidates)
-                for candidates in assigned_points.loc[
-                    assigned_points["area_assignment"].eq("ambiguous"),
-                    "area_candidates",
-                ]
-            ),
+            "shared_overlap_records": area_shared,
             "250m_grid_cells_affected": 0,
             "50m_grid_cells_affected": 0,
             "warnings_errors": "; ".join(validation.area_errors.get(area_key, [])),
@@ -1262,6 +1256,16 @@ def run_lowering_workflow(
                 area_failed = True
                 break
 
+            shared_joined = _joined.loc[
+                _joined["area_assignment"].eq("shared")
+            ].dropna(subset=[_grid_id_col])
+            shared_per_cell = shared_joined.groupby(_grid_id_col).size()
+            grid_out["shared_point_count"] = (
+                grid_out[_grid_id_col].map(shared_per_cell).fillna(0).astype(int)
+            )
+            grid_out["shared_lowering_m"] = (
+                grid_out["shared_point_count"] * sample_minutes / 60.0 * factor
+            ).round(4)
             grid_out["area_id"] = area["area_id"]
             grid_out["area_name"] = area_name
             grid_out["lowering_factor"] = factor
@@ -1311,19 +1315,10 @@ def run_lowering_workflow(
             "areas_encountered": 1,
             "areas_successfully_processed": 0,
             "ems_records_tracks_processed": 0,
-            "ems_records_tracks_assigned": int(
-                (
-                    assigned_points["area_assignment"].eq("matched")
-                    & assigned_points["area_id"].astype(str).eq(area_key)
-                ).sum()
-            ),
+            "ems_records_tracks_assigned": len(points_for_area(assigned_points, area_key)),
             "unmatched_ems_records_tracks": 0,
-            "ambiguous_boundary_records": sum(
-                area_key in json.loads(candidates)
-                for candidates in assigned_points.loc[
-                    assigned_points["area_assignment"].eq("ambiguous"),
-                    "area_candidates",
-                ]
+            "shared_overlap_records": int(
+                points_for_area(assigned_points, area_key)["area_assignment"].eq("shared").sum()
             ),
             "250m_grid_cells_affected": 0,
             "50m_grid_cells_affected": 0,
@@ -1359,10 +1354,10 @@ def run_lowering_workflow(
             if row["areas_successfully_processed"]
         ),
         "ems_records_tracks_assigned": int(
-            assigned_points["area_assignment"].eq("matched").sum()
+            assigned_points["area_assignment"].isin(["matched", "shared"]).sum()
         ),
         "unmatched_ems_records_tracks": unmatched_count,
-        "ambiguous_boundary_records": ambiguous_count,
+        "shared_overlap_records": shared_count,
         "250m_grid_cells_affected": sum(
             row["250m_grid_cells_affected"] for row in area_rows
         ),
@@ -1477,7 +1472,7 @@ def run_lowering_workflow(
         log_callback(f"Areas encountered: {len(areas_encountered):,}")
         log_callback(f"Areas successfully processed: {sum(row['areas_successfully_processed'] for row in area_rows):,}")
         log_callback(f"Unmatched records: {unmatched_count:,}")
-        log_callback(f"Ambiguous boundary records: {ambiguous_count:,}")
+        log_callback(f"Shared overlap records (counted in each area): {shared_count:,}")
         log_callback(f"Processing time: {elapsed / 60:.1f} minutes")
         log_callback("Outputs written:")
         for output in outputs_written:
