@@ -356,9 +356,16 @@ factor is never overwritten by later runs. The log lists each candidate rate
 with its QA status. (QA status compares against the configured rate, so a RED
 rate is not necessarily wrong data.)
 
-When write-back is on and the selected licence polygon layer is a GeoPackage
-containing a `lowering_factor` field, the Validator writes its 250 m regulatory
-result back to that layer. It matches the validation licence ID to the configured licence
+Where it writes: set "Model to update" to the Lowering Model GeoPackage
+(model layer `areas`, model area ID field `area_id`) to keep using the licence
+polygons (e.g. All_ADZ) for the calculation while filling the model's factors;
+each licence number is matched to the model's area_id. Leave "Model to update"
+blank to write to the licence polygon layer instead. Command line:
+--model-path, --model-layer, --model-id-field.
+
+When write-back is on and the target layer is a GeoPackage containing a
+`lowering_factor` field, the Validator writes its 250 m regulatory result
+to that layer. It matches the validation licence ID to the configured licence
 field (for the Lowering Model, `areas.area_id`) and stores
 `ValidatedRate_m3ph / 62,500` as metres/hour, matching the Lowerer's factor for
 a 250 m cell. Existing nonblank factor values are preserved; only blank or NULL

@@ -307,5 +307,79 @@ class LowCoverageWarningTests(unittest.TestCase):
         self.assertIn("no rate - the difference raster covers too little of the dredged cells", log)
 
 
+
+class ModelWriteBackTargetTests(unittest.TestCase):
+    def setUp(self):
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp_dir.cleanup)
+        self.root = Path(self.temp_dir.name)
+        self.model = self.root / "Lowering_Model.gpkg"
+        gpd.GeoDataFrame(
+            {
+                "area_id": ["137", "522"],
+                "area_name": ["Area 137", "Area 522"],
+                "lowering_factor": [None, 0.02],
+                "active": [1, 1],
+            },
+            geometry=[box(0, 0, 250, 250), box(250, 0, 500, 250)],
+            crs="EPSG:27700",
+        ).to_file(self.model, layer="areas", driver="GPKG")
+
+    def test_target_is_model_when_set_and_licence_layer_otherwise(self):
+        with_model = _settings(self.root, model_path=str(self.model))
+        self.assertEqual(
+            validator.writeback_target(with_model), (str(self.model), "areas", "area_id")
+        )
+        without = _settings(self.root, licence_layer="ADZ.gpkg", licence_layer_name="Query2")
+        self.assertEqual(
+            validator.writeback_target(without), ("ADZ.gpkg", "Query2", "LicenceNo")
+        )
+
+    def test_missing_model_file_is_reported_before_running(self):
+        settings = _settings(
+            self.root, write_model_factors=True, model_path=str(self.root / "nope.gpkg")
+        )
+        with self.assertRaisesRegex(ValueError, "Model to update was not found"):
+            settings.validate()
+
+    def test_run_fills_blank_model_factor_and_keeps_existing_one(self):
+        settings = _settings(
+            self.root, analysis_extent="TRACK_FOOTPRINT", write_model_factors=True,
+            model_path=str(self.model), licence_layer="ADZ.gpkg",
+        )
+        grid = _grid([("a", box(0, 0, 250, 250))])
+        licences = gpd.GeoDataFrame(
+            {"LicenceNo": ["137", "522"]},
+            geometry=[box(0, 0, 250, 250), box(250, 0, 500, 250)],
+            crs="EPSG:27700",
+        )
+        summary = pd.DataFrame({
+            "LicenceNo": ["137", "522"],
+            "ValidatedRate_m3ph": [1_057.0, 900.0],
+            "ValidatedRate_tph": [1_797.0, 1_530.0],
+            "QA_Status": ["RED", "RED"],
+        })
+        empty_ems = gpd.GeoDataFrame(
+            {"_datetime": []}, geometry=gpd.GeoSeries([], crs="EPSG:27700"), crs="EPSG:27700"
+        )
+        messages = []
+        with (
+            patch.object(validator, "prepare_difference_raster", return_value="d.tif"),
+            patch.object(validator, "validate_bathymetric_difference_raster", return_value={}),
+            patch.object(validator, "read_vector", side_effect=[grid, licences]),
+            patch.object(validator, "load_ems", return_value=empty_ems),
+            patch.object(validator, "_run_validation_single", return_value=summary),
+        ):
+            validator.run_validation(settings, messages.append)
+
+        areas = gpd.read_file(self.model, layer="areas").set_index("area_id")
+        self.assertAlmostEqual(areas.loc["137", "lowering_factor"], 1_057.0 / 62_500)
+        self.assertAlmostEqual(areas.loc["522", "lowering_factor"], 0.02)  # not overwritten
+        text = "\n".join(messages)
+        self.assertIn("Write-back target:", text)
+        self.assertIn("matching LicenceNo to area_id", text)
+        self.assertIn("Updated 1 blank lowering_factor value(s)", text)
+
+
 if __name__ == "__main__":
     unittest.main()

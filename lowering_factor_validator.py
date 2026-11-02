@@ -136,6 +136,9 @@ class Settings:
     rate_method: str = "POOLED"
     reuse_ems_cache: bool = True
     licence_filter: str = ""
+    model_path: str = ""
+    model_layer: str = "areas"
+    model_id_field: str = "area_id"
 
     @classmethod
     def from_dict(cls, data: dict) -> "Settings":
@@ -250,6 +253,11 @@ class Settings:
             raise ValueError("reuse_ems_cache must be true or false.")
         if not isinstance(self.licence_filter, str):
             raise ValueError("licence_filter must be text, e.g. '137, 522'.")
+        if self.write_model_factors and self.model_path.strip():
+            if not Path(self.model_path).is_file():
+                raise ValueError(f"Model to update was not found: {self.model_path}")
+            if not self.model_id_field.strip():
+                raise ValueError("Enter the model's area ID field (e.g. area_id).")
 
         try:
             CRS.from_user_input(self.projected_crs)
@@ -334,6 +342,16 @@ def parse_cli_settings(argv: Optional[list[str]] = None) -> Settings:
             "Fill blank lowering_factor values in the licence GeoPackage from "
             "the 250 m validated rates. Off unless this flag is given."
         ),
+    )
+    parser.add_argument(
+        "--model-path",
+        default=None,
+        help="GeoPackage whose lowering_factor values write-back fills "
+        "(default: the licence layer itself).",
+    )
+    parser.add_argument("--model-layer", default=None, help="Model layer (default: areas).")
+    parser.add_argument(
+        "--model-id-field", default=None, help="Model area ID field (default: area_id)."
     )
     parser.add_argument(
         "--background-correction",
@@ -457,6 +475,9 @@ def parse_cli_settings(argv: Optional[list[str]] = None) -> Settings:
         "rate_method": args.rate_method,
         "reuse_ems_cache": args.reuse_ems_cache,
         "licence_filter": args.licence_filter,
+        "model_path": args.model_path,
+        "model_layer": args.model_layer,
+        "model_id_field": args.model_id_field,
     }
     for field_name, value in cli_overrides.items():
         if value is not None:
@@ -5001,14 +5022,28 @@ def _run_validation(
                     f"{getattr(row, 'ValidatedRate_tph'):.3f} t/h; "
                     f"QA status {getattr(row, 'QA_Status')}."
                 )
-        update_model_lowering_factors(
-            settings.licence_layer,
-            settings.licence_layer_name,
-            settings.licence_field,
-            factor_summary,
-            log,
+        target, layer, id_field = writeback_target(settings)
+        log(
+            f"Write-back target: {target} | layer {layer or '(default)'} | "
+            f"matching LicenceNo to {id_field}."
         )
+        update_model_lowering_factors(target, layer, id_field, factor_summary, log)
     return result
+
+
+def writeback_target(settings: Settings) -> tuple[str, str, str]:
+    """(GeoPackage, layer, ID field) that model write-back fills.
+
+    The separate model when one is set; otherwise the licence layer itself,
+    as before.
+    """
+    if settings.model_path.strip():
+        return (
+            settings.model_path.strip(),
+            settings.model_layer.strip(),
+            settings.model_id_field.strip(),
+        )
+    return settings.licence_layer, settings.licence_layer_name, settings.licence_field
 
 
 RUN_STAGES = (
@@ -5320,6 +5355,35 @@ class App(tk.Tk):
             onvalue="True",
             offvalue="False",
         ).grid(row=24, column=0, columnspan=3, sticky="w", padx=6, pady=3)
+        ttk.Label(fields, text="Model to update (write-back target)").grid(row=25, column=0, sticky="w", padx=6, pady=3)
+        self.vars["model_path"] = tk.StringVar(value="")
+        ttk.Entry(fields, textvariable=self.vars["model_path"]).grid(row=25, column=1, sticky="ew", padx=6)
+
+        def browse_model():
+            value = filedialog.askopenfilename(
+                title="Select the Lowering Model GeoPackage",
+                filetypes=[("GeoPackage", "*.gpkg"), ("All files", "*.*")],
+            )
+            if value:
+                self.vars["model_path"].set(value)
+
+        ttk.Button(fields, text="Select file...", command=browse_model).grid(row=25, column=2, padx=4)
+        ttk.Label(fields, text="Model layer").grid(row=26, column=0, sticky="w", padx=6, pady=3)
+        self.vars["model_layer"] = tk.StringVar(value="areas")
+        model_layer_combo = ttk.Combobox(fields, textvariable=self.vars["model_layer"], state="readonly", values=["areas"])
+        model_layer_combo.grid(row=26, column=1, sticky="ew", padx=6)
+        ttk.Button(
+            fields,
+            text="Load layers",
+            command=lambda: self.load_vector_layers("model_path", "model_id_field", "model_layer", model_layer_combo),
+        ).grid(row=26, column=2, padx=4)
+        ttk.Label(fields, text="Model area ID field (matched to licence number)").grid(row=27, column=0, sticky="w", padx=6, pady=3)
+        self.vars["model_id_field"] = tk.StringVar(value="area_id")
+        ttk.Entry(fields, textvariable=self.vars["model_id_field"]).grid(row=27, column=1, sticky="ew", padx=6)
+        ttk.Label(
+            fields,
+            text="Leave 'Model to update' blank to write to the licence layer instead.",
+        ).grid(row=28, column=1, columnspan=2, sticky="w", padx=6, pady=(0, 3))
 
         qa = ttk.LabelFrame(body, text="3. Calculation and QA settings")
         qa.grid(row=2, column=0, sticky="ew", padx=10, pady=8)
