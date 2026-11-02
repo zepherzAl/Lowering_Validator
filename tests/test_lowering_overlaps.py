@@ -189,5 +189,63 @@ class SmallLoweringIsKeptTests(unittest.TestCase):
         self.assertAlmostEqual(two_quarters, 2 * expected, delta=1e-5)
 
 
+
+class SharedEMSImportTests(unittest.TestCase):
+    """The lowering tool reuses the validator's import instead of importing again."""
+
+    def _write_tracks(self, root: Path) -> None:
+        header = "DATE,TIME,GPSLAT,GPSLON,DREDGE\n"
+        for name, dredge in (("01-01-2024 CGI.txt", 3), ("01-01-2024 Fal.dat", 3), ("01-01-2024 Reim.csv", 0)):
+            rows = "".join(
+                f"01 Jun 2024,10:{minute:02d}:{second:02d},50.59,-1.55,{dredge}\n"
+                for minute in range(4)
+                for second in (0, 20, 40)
+            )
+            (root / name).write_text(header + rows, encoding="utf-8")
+
+    def test_reuses_validator_records_without_second_import(self):
+        import lowering_factor_validator as validator
+        from ems_database import EMSDatabase
+
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder) / "Tracks"
+            root.mkdir()
+            self._write_tracks(root)
+            shared_db = Path(folder) / "shared.sqlite3"
+            own_db = Path(folder) / "own.sqlite3"
+            settings = validator.Settings(
+                difference_raster="", calibration_grid="", licence_layer="",
+                ems_source=str(root), output_folder=str(Path(folder) / "out"),
+                ems_x_field="GPSLON", ems_y_field="GPSLAT",
+            )
+            with patch.object(validator, "EMSDatabase", lambda source, log=None: EMSDatabase(source, shared_db, log=log)):
+                validator.load_ems(settings, lambda _: None)
+
+            messages = []
+            with patch.object(lowerer, "EMSDatabase", lambda source: EMSDatabase(source, shared_db)):
+                shared, *_ = lowerer.process_all_tracks(
+                    input_folder=root, dredge_value=3, dredge_mode="equals",
+                    sample_minutes=1, log_callback=messages.append,
+                )
+            profiles = EMSDatabase(root, shared_db).ready_profiles()
+            with patch.object(lowerer, "EMSDatabase", lambda source: EMSDatabase(source, own_db)):
+                own, *_ = lowerer.process_all_tracks(
+                    input_folder=root, dredge_value=3, dredge_mode="equals", sample_minutes=1,
+                )
+
+        self.assertTrue(any("no second import" in m for m in messages))
+        # One shared profile, still holding all three files (the .dat was not removed).
+        self.assertEqual(len(profiles), 1)
+        self.assertTrue(profiles[0][0].startswith("validator:"))
+        self.assertEqual(profiles[0][1], 3)
+        # Same sampled dredging minutes as the lowering tool's own import
+        # (its own import skips .dat files, so compare the .txt file only).
+        shared_txt = shared.loc[shared["source_file"].eq("01-01-2024 CGI.txt")]
+        own_txt = own.loc[own["source_file"].eq("01-01-2024 CGI.txt")]
+        self.assertEqual(len(shared_txt), 4)
+        self.assertEqual(shared_txt["datetime"].tolist(), own_txt["datetime"].tolist())
+        self.assertEqual(len(shared), 8)  # .txt and .dat dredging files, 4 minutes each
+
+
 if __name__ == "__main__":
     unittest.main()

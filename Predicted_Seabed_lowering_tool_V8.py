@@ -101,6 +101,56 @@ def _iter_lowerer_ems_records(file_path: Path):
         )
 
 
+LOWERER_PROFILE = "lowerer:DATE,TIME,GPSLAT,GPSLON,DREDGE:v1"
+# Must match the file types the validator discovers: a sync deletes a profile's
+# records for any file missing from the list it is given.
+VALIDATOR_EMS_EXTENSIONS = (".csv", ".txt", ".dat")
+
+
+def _shared_validator_import(database: EMSDatabase, input_folder: Path):
+    """The validator's import of this EMS folder, if one exists, ready to reuse.
+
+    Returns (profile, files, parser, bulk_parser, profile_crs) using the
+    validator's own parser, so new files are added to the same shared copy,
+    or None when the folder has no validator import yet.
+    """
+    for profile, _files in database.ready_profiles("validator:"):
+        try:
+            fields = json.loads(profile.split(":", 1)[1])
+        except (IndexError, ValueError):
+            continue
+        if fields.get("kind") != "delimited":
+            continue
+        import lowering_factor_validator as validator
+
+        settings = validator.Settings(
+            difference_raster="",
+            calibration_grid="",
+            licence_layer="",
+            ems_source=str(input_folder),
+            output_folder="",
+            ems_x_field=fields["x"],
+            ems_y_field=fields["y"],
+            ems_datetime_field=fields["datetime"],
+            ems_time_field=fields["time"],
+            ems_dredge_field=fields["dredge"],
+            ems_vessel_field=fields["vessel"],
+        )
+        files = discover_files(input_folder, VALIDATOR_EMS_EXTENSIONS)
+        return (
+            profile,
+            files,
+            lambda file: validator._iter_validator_delimited_records(file, settings),
+            lambda file, root, source_path, profile_name: (
+                validator._iter_validator_delimited_batches(
+                    file, settings, root, source_path, profile_name
+                )
+            ),
+            "EPSG:4326",
+        )
+    return None
+
+
 def sample_to_interval(df: pd.DataFrame, sample_minutes: int) -> pd.DataFrame:
     """Reduce EMS records to one point per file per selected interval.
 
@@ -129,17 +179,36 @@ def process_all_tracks(
     spatial_bounds=None,
 ) -> tuple[pd.DataFrame, pd.DataFrame, int, int, int, int, int]:
     """Synchronize the shared index and retain full and area-candidate samples."""
-    profile = "lowerer:DATE,TIME,GPSLAT,GPSLON,DREDGE:v1"
-    files = discover_files(input_folder, (".txt", ".csv"))
     database = EMSDatabase(input_folder)
-    database.sync_files(
-        files,
-        profile,
-        _iter_lowerer_ems_records,
-        log=log_callback,
-        cancel_event=cancel_event,
-        progress_callback=progress_callback,
-    )
+    shared = _shared_validator_import(database, input_folder)
+    if shared is not None:
+        profile, files, parser, bulk_parser, profile_crs = shared
+        if log_callback:
+            log_callback(
+                "Using the EMS records already imported by the Lowering Factor "
+                "Validator for this folder (no second import)."
+            )
+        database.sync_files(
+            files,
+            profile,
+            parser,
+            log=log_callback,
+            cancel_event=cancel_event,
+            progress_callback=progress_callback,
+            bulk_parser=bulk_parser,
+            profile_crs=profile_crs,
+        )
+    else:
+        profile = LOWERER_PROFILE
+        files = discover_files(input_folder, (".txt", ".csv"))
+        database.sync_files(
+            files,
+            profile,
+            _iter_lowerer_ems_records,
+            log=log_callback,
+            cancel_event=cancel_event,
+            progress_callback=progress_callback,
+        )
 
     total_files = database.source_file_count(profile)
     if total_files == 0:

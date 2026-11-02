@@ -1354,6 +1354,17 @@ class EMSDatabase:
                 )
         return updated
 
+    def ready_profiles(self, prefix: str = "") -> list[tuple[str, int]]:
+        """Import profiles for this source root with ready files, most files first."""
+        with self._connection() as connection:
+            rows = connection.execute(
+                "SELECT profile, COUNT(*) AS files FROM source_files "
+                "WHERE source_root = ? AND status = 'ready' AND profile LIKE ? "
+                "GROUP BY profile ORDER BY files DESC, profile",
+                (str(self.source_root), prefix.replace("%", "") + "%"),
+            ).fetchall()
+        return [(str(row["profile"]), int(row["files"])) for row in rows]
+
     def months_without_records(
         self, profile: str, start: datetime, end: datetime
     ) -> list[str]:
