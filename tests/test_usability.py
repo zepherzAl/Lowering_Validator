@@ -397,9 +397,13 @@ class ModelWriteBackTargetTests(unittest.TestCase):
         ):
             validator.run_validation(settings, messages.append, confirm_replace=confirm_replace)
         areas = gpd.read_file(self.model, layer="areas").set_index("area_id")
-        history = pd.read_sql_query(
-            "SELECT * FROM lowering_factor_history ORDER BY fid", sqlite3.connect(self.model)
-        )
+        connection = sqlite3.connect(self.model)
+        try:  # close it so Windows can delete the temporary folder
+            history = pd.read_sql_query(
+                "SELECT * FROM lowering_factor_history ORDER BY fid", connection
+            )
+        finally:
+            connection.close()
         return areas, history, "\n".join(messages)
 
     def test_replace_after_confirmation_updates_and_records_history(self):
