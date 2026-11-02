@@ -259,6 +259,38 @@ uncorrected and regression rates, background, cells and hours used, with
 buttons to open the output folder, summary CSV and processing log. "Show last
 results" reopens it.
 
+THE FORM
+--------
+The app remembers the form between sessions (saved on Run and on closing, in
+.lowering_factor_validator_settings.json beside the app). "Save settings" and
+"Load settings" still keep named copies, e.g. one per survey.
+
+Each file and folder is checked as soon as it is chosen or typed. A green tick
+or red cross underneath says what was found, e.g. the layer, number of cells
+and whether the ID field exists, how many EMS track files are in the folder, or
+how many model areas have a blank lowering_factor. Grid, licence and model
+layers are filled in automatically with the layer holding the expected ID
+field. If any check fails when you press Run, the app lists the problems and
+asks whether to run anyway.
+
+Labels marked (i) show an explanation when the mouse rests on them.
+
+EMS field names, the sample interval, raster units, change tolerance,
+validation mode, analysis extent and QA thresholds are under "Show advanced
+settings". They are set once and rarely changed.
+
+PREDICTED SEABED LOWERING TOOL
+------------------------------
+The lowering tool remembers all of its settings, including the dredge
+comparison, spatial join and output ticks. Before a run it checks the Lowering
+Model: if an area has no lowering_factor it names the areas and says to run the
+Validator with model write-back (or enter the factor in QGIS). A run with no
+usable factors is stopped; otherwise you can choose to run the other areas.
+When the run finishes, a window lists each area with its factor, dredging hours,
+predicted volume, maximum lowering and cells, with buttons to open the output
+folder and summary CSV. multi_area_processing_summary.csv now includes
+dredge_hours, volume_m3 and max_lowering_m for each area.
+
 INSTALLATION
 ------------
 Store all files locally. From a command prompt in this folder:

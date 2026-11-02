@@ -355,3 +355,65 @@ def lowering_model_summary(model: LoweringModel, validation: ModelValidation) ->
         f"Areas with lowering factors: {int(areas_with_factor.sum())} | "
         f"Processable areas: {len(validation.eligible_area_ids)}"
     )
+
+
+FACTOR_HINT = (
+    "Run the Lowering Factor Validator with model write-back ticked, "
+    "or enter the factor in the areas layer in QGIS."
+)
+
+
+def areas_missing_factor(model: LoweringModel) -> list[str]:
+    """Active area_ids whose lowering_factor is blank, not a number or negative."""
+    if "lowering_factor" not in model.areas or "area_id" not in model.areas:
+        return []
+    active = (
+        model.areas["active"].map(_boolean_value).eq(True)
+        if "active" in model.areas
+        else pd.Series(True, index=model.areas.index)
+    )
+    factors = pd.to_numeric(model.areas["lowering_factor"], errors="coerce")
+    bad = factors.isna() | ~factors.map(lambda v: pd.notna(v) and math.isfinite(float(v)) and float(v) >= 0)
+    rows = model.areas.loc[active & bad & model.areas["area_id"].notna()]
+    return [str(value) for value in rows["area_id"]]
+
+
+def factor_readiness(
+    model: LoweringModel,
+    validation: ModelValidation,
+    selected_area_id: str | None = None,
+) -> tuple[str, list[str]]:
+    """Say whether the model can be run: ("ok" | "warn" | "block", message lines)."""
+    if validation.errors:
+        return "block", ["The Lowering Model has problems:", *validation.errors]
+    missing = areas_missing_factor(model)
+    if selected_area_id is not None:
+        key = str(selected_area_id)
+        if key in missing:
+            return "block", [f"Area {key} has no lowering factor.", FACTOR_HINT]
+        if key not in validation.eligible_area_ids:
+            issues = validation.area_errors.get(key, ["it is not available for processing"])
+            return "block", [f"Area {key} cannot be processed: " + "; ".join(issues)]
+        return "ok", []
+    if not validation.eligible_area_ids:
+        if missing:
+            return "block", [
+                f"None of the {len(missing)} active areas has a lowering factor yet: "
+                + ", ".join(missing) + ".",
+                FACTOR_HINT,
+            ]
+        return "block", ["No areas in the model can be processed."]
+    lines = []
+    if missing:
+        lines.append(
+            f"{len(missing)} area(s) have no lowering factor and will be skipped: "
+            + ", ".join(missing) + "."
+        )
+        lines.append(FACTOR_HINT)
+    other = sorted(
+        key for key in validation.area_errors
+        if key not in missing and key not in validation.eligible_area_ids
+    )
+    for key in other:
+        lines.append(f"Area {key} will be skipped: " + "; ".join(validation.area_errors[key]))
+    return ("warn" if lines else "ok"), lines

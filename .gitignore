@@ -1,3 +1,5 @@
 __pycache__/
 *.py[cod]
 backups/
+.lowering_factor_validator_settings.json
+.ems_seabed_lowering_v8_settings.json

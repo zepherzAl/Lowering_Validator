@@ -116,6 +116,9 @@ class WorkflowOverlapTests(unittest.TestCase):
         self.assertEqual(areas.loc["A", "ems_records_tracks_assigned"], 90)
         self.assertEqual(areas.loc["B", "ems_records_tracks_assigned"], 42)
         self.assertEqual(areas.loc["A", "shared_overlap_records"], 30)
+        self.assertAlmostEqual(areas.loc["A", "dredge_hours"], 1.5)  # 60 + 30 minutes
+        self.assertAlmostEqual(areas.loc["A", "volume_m3"], 1.5 * FACTOR * 62_500)
+        self.assertAlmostEqual(areas.loc["B", "max_lowering_m"], 0.05)
         run = summary.loc[summary["summary_scope"].eq("run")].iloc[0]
         self.assertEqual(run["shared_overlap_records"], 30)
         self.assertTrue(any("double-counts" in message for message in messages))

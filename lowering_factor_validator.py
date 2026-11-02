@@ -59,6 +59,7 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
+from ems_toolkit_common import SettingsStore, Tooltip
 from ems_database import (
     INSERT_BATCH_SIZE,
     EMSDatabase,
@@ -709,6 +710,145 @@ def vector_layer_choices(path: str, identifying_field: str) -> tuple[list[str], 
         if any(str(field).casefold() == identifying_field.casefold() for field in fields):
             matching_layers.append(layer_name)
     return layers, matching_layers[0] if matching_layers else layers[0]
+
+
+@dataclass
+class InputCheck:
+    """Result of a quick check on one input in the form."""
+
+    ok: Optional[bool]  # None = nothing to check yet
+    message: str
+    layers: tuple[str, ...] = ()
+    recommended_layer: str = ""
+
+
+EMS_TRACK_EXTENSIONS = (".csv", ".txt", ".dat")
+
+
+def _has_field(fields: list[str], name: str) -> bool:
+    return any(str(field).casefold() == name.casefold() for field in fields)
+
+
+def _check_vector(path: str, layer: str, id_field: str, noun: str) -> InputCheck:
+    if not Path(path).exists():
+        return InputCheck(False, "File not found.")
+    try:
+        layers, recommended = vector_layer_choices(path, id_field or "")
+    except ValueError as exc:
+        return InputCheck(False, str(exc))
+    layers_tuple = tuple(layers)
+    if layer and layer not in layers:
+        return InputCheck(
+            False, f"Layer '{layer}' is not in this file (it has: {', '.join(layers[:6])}).",
+            layers_tuple, recommended,
+        )
+    chosen = layer or recommended
+    try:
+        info = pyogrio.read_info(path, layer=chosen)
+    except (OSError, ValueError, RuntimeError) as exc:
+        return InputCheck(False, f"Could not read layer '{chosen}': {exc}", layers_tuple, recommended)
+    fields = [str(field) for field in info["fields"]]
+    if id_field and not _has_field(fields, id_field):
+        return InputCheck(
+            False,
+            f"Layer '{chosen}' has no '{id_field}' field (fields: {', '.join(fields[:8])}).",
+            layers_tuple, recommended,
+        )
+    count = info.get("features")
+    count_text = f"{int(count):,} {noun}" if count is not None and count >= 0 else noun
+    return InputCheck(True, f"Layer '{chosen}': {count_text}, '{id_field}' found.", layers_tuple, recommended)
+
+
+def _check_raster(path: str) -> InputCheck:
+    if not Path(path).exists():
+        return InputCheck(False, "File not found.")
+    try:
+        with rasterio.open(path) as raster:
+            size = f"{raster.res[0]:g} m pixels, {raster.width:,} x {raster.height:,}"
+            if raster.crs is None:
+                return InputCheck(False, f"{size}; the raster has no CRS.")
+            try:
+                epsg = raster.crs.to_epsg()
+            except Exception:
+                epsg = None
+            crs_text = f"EPSG:{epsg}" if epsg else "CRS set"
+    except Exception as exc:
+        return InputCheck(False, f"Could not open raster: {exc}")
+    return InputCheck(True, f"{size}, {crs_text}.")
+
+
+def _check_ems_source(path: str, file_limit: int = 200_000) -> InputCheck:
+    source = Path(path)
+    if not source.exists():
+        return InputCheck(False, "Not found.")
+    if source.is_file():
+        suffix = source.suffix.lower()
+        if suffix in EMS_TRACK_EXTENSIONS or suffix in VECTOR_EMS_EXTENSIONS:
+            return InputCheck(True, "EMS file found.")
+        return InputCheck(False, f"'{suffix}' is not an EMS track file (.csv, .txt, .dat or a GIS layer).")
+    count = 0
+    for _folder, _dirs, names in os.walk(source):
+        count += sum(1 for name in names if name.lower().endswith(EMS_TRACK_EXTENSIONS))
+        if count >= file_limit:
+            return InputCheck(True, f"Over {file_limit:,} EMS track files found.")
+    if count == 0:
+        return InputCheck(False, "No .csv, .txt or .dat track files in this folder or its subfolders.")
+    return InputCheck(True, f"{count:,} EMS track files found.")
+
+
+def _check_output_folder(path: str) -> InputCheck:
+    folder = Path(path)
+    if folder.is_dir():
+        if os.access(folder, os.W_OK):
+            return InputCheck(True, "Folder exists and can be written to.")
+        return InputCheck(False, "Folder exists but cannot be written to.")
+    if folder.exists():
+        return InputCheck(False, "This is a file, not a folder.")
+    if folder.parent.is_dir():
+        return InputCheck(True, "Folder will be created.")
+    return InputCheck(False, "Neither the folder nor its parent folder exists.")
+
+
+def _check_model(path: str, layer: str, id_field: str) -> InputCheck:
+    check = _check_vector(path, layer, id_field, "areas")
+    if not check.ok:
+        return check
+    chosen = layer or check.recommended_layer
+    try:
+        fields = [str(field) for field in pyogrio.read_info(path, layer=chosen)["fields"]]
+        if not _has_field(fields, "lowering_factor"):
+            return InputCheck(False, f"Layer '{chosen}' has no 'lowering_factor' field.", check.layers, check.recommended_layer)
+        table = pyogrio.read_dataframe(path, layer=chosen, columns=["lowering_factor"], read_geometry=False)
+    except Exception as exc:
+        return InputCheck(False, f"Could not read layer '{chosen}': {exc}", check.layers, check.recommended_layer)
+    blank = int(sum(_factor_is_blank(value) or (isinstance(value, float) and math.isnan(value)) for value in table["lowering_factor"]))
+    return InputCheck(
+        True,
+        f"Layer '{chosen}': {len(table):,} areas, {blank:,} with a blank lowering_factor.",
+        check.layers, check.recommended_layer,
+    )
+
+
+def check_input(key: str, values: dict[str, str]) -> InputCheck:
+    """Quick check of one form input, so problems show before a run starts."""
+    path = str(values.get(key, "")).strip()
+    if not path:
+        if key == "model_path":
+            return InputCheck(None, "Blank: write-back goes to the licence layer.")
+        return InputCheck(None, "")
+    if key == "difference_raster":
+        return _check_raster(path)
+    if key == "calibration_grid":
+        return _check_vector(path, values.get("calibration_grid_layer", "").strip(), values.get("grid_id_field", "").strip(), "cells")
+    if key == "licence_layer":
+        return _check_vector(path, values.get("licence_layer_name", "").strip(), values.get("licence_field", "").strip(), "polygons")
+    if key == "ems_source":
+        return _check_ems_source(path)
+    if key == "output_folder":
+        return _check_output_folder(path)
+    if key == "model_path":
+        return _check_model(path, values.get("model_layer", "").strip(), values.get("model_id_field", "").strip())
+    return InputCheck(None, "")
 
 
 def _quote_sqlite_identifier(identifier: str) -> str:
@@ -5302,8 +5442,102 @@ def _open_newest(folder: Path, pattern: str) -> None:
     _open_path(matches[-1])
 
 
+FIELD_HELP = {
+    "difference_raster": "Bathymetric difference between the two surveys (e.g. 2022 to 2025), "
+    "made in MapInfo or another GIS. .flt or GeoTIFF, in metres.",
+    "calibration_grid": "The 250 m grid of cells to average the difference raster over. "
+    "Use the de-duplicated copy so overlapping cells are not counted twice.",
+    "licence_layer": "Licence polygons (e.g. All_ADZ.gpkg, layer Query2). Each grid cell is given "
+    "the licence it falls in.",
+    "ems_source": "A single EMS file, or the root folder of EMS tracks. Subfolders are searched. "
+    "Use 'Select file...' on the right for a single file.",
+    "output_folder": "Where results are written. Each run adds its own files; earlier results are kept.",
+    "resolution_mode": "250 m is the regulatory result used for lowering factors. "
+    "50 m is exploratory only: cells have too few dredging hours to be reliable.",
+    "calibration_grid_layer": "Layer inside the grid file. Filled in automatically with the layer "
+    "that has the Grid ID field.",
+    "licence_layer_name": "Layer inside the licence file. Filled in automatically with the layer "
+    "that has the licence number field.",
+    "grid_id_field": "Field that uniquely names each grid cell.",
+    "licence_field": "Field holding the licence number (LicenceNo in All_ADZ).",
+    "survey_start": "Date of the earlier survey (dd/mm/yyyy). Only dredging between the two "
+    "surveys is counted.",
+    "survey_end": "Date of the later survey (dd/mm/yyyy).",
+    "raster_value_convention": "ELEVATION: values are heights (deeper = more negative). "
+    "POSITIVE_DEPTH: values are depths (deeper = bigger number).",
+    "source_sign": "Which sign means the seabed got lower, after the value convention above. "
+    "Elevation earlier minus later: positive_is_lowering. Elevation later minus earlier: "
+    "negative_is_lowering. The pre-run check warns if the raster looks the wrong way round.",
+    "background_correction": "UNDREDGED_CELLS: the median lowering of cells with no dredging "
+    "(natural change, about 0.08 m on the 2022-2025 survey) is subtracted from every cell. "
+    "NONE: use the raw difference.",
+    "rate_method": "POOLED (recommended): total volume / total dredging hours across the licence. "
+    "CELL_FILTERS: only cells that pass the minimum hours and minimum lowering filters count.",
+    "licence_filter": "Run only these licences, e.g. 137 or 137, 522. Blank runs every licence. "
+    "'Choose...' lists the licences in the licence layer.",
+    "reuse_ems_cache": "Keeps the EMS records from the last run with the same EMS settings and "
+    "dates, so later runs take about a minute instead of re-reading the database.",
+    "bulk_density": "Converts m³ to tonnes. Only affects the t/hour columns; the lowering "
+    "factor is worked out in m³.",
+    "configured_rate_tph": "The rate currently used in the lowering model, in t/hour. The status "
+    "(GREEN / AMBER / RED) compares the validated rate with this.",
+    "green_tolerance_percent": "Validated and configured rates within this % are GREEN.",
+    "amber_tolerance_percent": "Within this % is AMBER; beyond it is RED.",
+    "ems_x_field": "EMS longitude (or X) column.",
+    "ems_y_field": "EMS latitude (or Y) column.",
+    "ems_datetime_field": "Combined date-time column. If the files have separate DATE and TIME "
+    "columns, they are combined automatically.",
+    "ems_time_field": "Time column, used when date and time are in separate columns.",
+    "ems_dredge_field": "Column that shows the dredging state.",
+    "ems_vessel_field": "Vessel column. If it is missing, the vessel folder or file name is used.",
+    "ems_dredge_value": "DREDGE value that means actively dredging (3).",
+    "ems_dredge_mode": "equals: only that value counts. greater_or_equal: that value or higher.",
+    "sample_interval_minutes": "Minutes each EMS record stands for. Must match how often EMS logs; "
+    "the log warns if it doesn't.",
+    "projected_crs": "Metric CRS used for areas and distances (British National Grid by default).",
+    "difference_units": "Units of the difference raster.",
+    "change_tolerance_m": "Cells changing by less than this are classed as no significant change "
+    "in the change statistics.",
+    "validation_mode": "Changes the change-summary statistics and warnings. DEEPENING_ONLY is "
+    "the usual choice.",
+    "analysis_extent": "FULL_OVERLAP (recommended) keeps only grid cells the raster covers.",
+    "background_min_cells": "Fewest undredged cells needed to estimate natural lowering. With "
+    "fewer, no correction is made and the log says so.",
+    "minimum_ems_hours": "Cells with less dredging than this are flagged (they still count in "
+    "the POOLED rate).",
+    "minimum_coverage_percent": "Cells with less raster coverage than this are left out.",
+    "minimum_detectable_change_m": "Lowering smaller than this is below survey accuracy. Used by "
+    "CELL_FILTERS and the per-cell QA.",
+    "maximum_rate_tph": "Licence rates above this are flagged as implausible.",
+    "write_model_factors": "After the run, write each licence's validated 250 m lowering factor "
+    "into the model. Blank factors are filled; existing ones are kept unless 'Replace' is ticked.",
+    "replace_model_factors": "Also replace factors that already have a value, for the licences in "
+    "this run only. You are asked to confirm each change, and it is recorded in the model's "
+    "lowering_factor_history table.",
+    "model_path": "The Lowering Model GeoPackage used by the seabed lowering tool "
+    "(e.g. Lowering_Model.gpkg). Back it up before writing.",
+    "model_layer": "Layer holding one row per area with a lowering_factor field (areas).",
+    "model_id_field": "Field in the model layer matched to the licence number (area_id).",
+}
+
+CHECKED_INPUTS = {
+    "difference_raster": ("difference_raster",),
+    "calibration_grid": ("calibration_grid", "calibration_grid_layer", "grid_id_field"),
+    "licence_layer": ("licence_layer", "licence_layer_name", "licence_field"),
+    "ems_source": ("ems_source",),
+    "output_folder": ("output_folder",),
+    "model_path": ("model_path", "model_layer", "model_id_field"),
+}
+CHECK_LAYER_KEYS = {
+    "calibration_grid": "calibration_grid_layer",
+    "licence_layer": "licence_layer_name",
+    "model_path": "model_layer",
+}
+SETTINGS_MEMORY_FILE = ".lowering_factor_validator_settings.json"
+
+
 class App(tk.Tk):
-    def __init__(self):
+    def __init__(self, settings_store: SettingsStore | None = None):
         super().__init__()
         self.title(f"{APP_NAME} v{VERSION}")
         self.geometry("980x820")
@@ -5317,79 +5551,201 @@ class App(tk.Tk):
         self._last_summary = None
         self._last_output = None
         self.run_button = None
+        self._store = settings_store or SettingsStore(SETTINGS_MEMORY_FILE)
+        self._check_labels = {}
+        self._check_results = {}
+        self._check_jobs = {}
+        self._check_serial = {}
+        self._check_queue = queue.Queue()
+        self._layer_combos = {}
+        self._advanced_open = False
         self._build()
+        self._restore_settings()
+        for key, watched in CHECKED_INPUTS.items():
+            for watched_key in watched:
+                self.vars[watched_key].trace_add("write", lambda *_, k=key: self._schedule_check(k))
+            self._schedule_check(key, delay_ms=50)
+        self.after(200, self._poll_checks)
+        self.protocol("WM_DELETE_WINDOW", self._on_close)
 
-    def add_path(self, parent, row, label, key, directory=False):
-        ttk.Label(parent, text=label).grid(row=row, column=0, sticky="w", padx=6, pady=4)
+    # ----- form helpers -------------------------------------------------
+    def _label(self, parent, row, text, key):
+        help_text = FIELD_HELP.get(key)
+        label = ttk.Label(parent, text=text + ("  ⓘ" if help_text else ""))
+        label.grid(row=row, column=0, sticky="w", padx=6, pady=3)
+        if help_text:
+            Tooltip(label, help_text)
+        return label
+
+    def _help(self, widget, key):
+        if key in FIELD_HELP:
+            Tooltip(widget, FIELD_HELP[key])
+
+    def add_path(self, parent, row, label, key, directory=False, filetypes=None, title=None, on_pick=None):
+        """Path row with a browse button and a check message on the row below."""
+        self._label(parent, row, label, key)
         var = tk.StringVar()
         self.vars[key] = var
-        ttk.Entry(parent, textvariable=var).grid(row=row, column=1, sticky="ew", padx=6, pady=4)
+        entry = ttk.Entry(parent, textvariable=var)
+        entry.grid(row=row, column=1, sticky="ew", padx=6, pady=(4, 0))
+        self._help(entry, key)
+
         def browse():
-            value = filedialog.askdirectory() if directory else filedialog.askopenfilename()
+            if directory:
+                value = filedialog.askdirectory(title=title or label)
+            else:
+                value = filedialog.askopenfilename(
+                    title=title or label, filetypes=filetypes or [("All files", "*.*")]
+                )
             if value:
                 var.set(value)
+                if on_pick is not None:
+                    on_pick(value)
+
         button_text = "Select folder..." if directory else "Select file..."
-        ttk.Button(parent, text=button_text, command=browse).grid(row=row, column=2, padx=6, pady=4)
-
-    def add_difference_raster_path(self, parent, row):
-        ttk.Label(parent, text="Bathymetric difference raster").grid(
-            row=row, column=0, sticky="w", padx=6, pady=4
-        )
-        variable = tk.StringVar()
-        self.vars["difference_raster"] = variable
-        ttk.Entry(parent, textvariable=variable).grid(
-            row=row, column=1, sticky="ew", padx=6, pady=4
-        )
-
-        def browse():
-            value = filedialog.askopenfilename(
-                title="Select bathymetric-difference raster",
-                filetypes=[
-                    ("ESRI Binary Float Grid", "*.flt"),
-                    ("Numeric raster datasets", "*.flt *.tif *.tiff"),
-                    ("All files", "*.*"),
-                ],
-            )
-            if not value:
-                return
-            variable.set(value)
-            messages = []
-            try:
-                self.log("Validating selected bathymetric-difference raster...")
-                validate_bathymetric_difference_raster(
-                    value,
-                    self.vars["difference_units"].get(),
-                    self.vars["source_sign"].get(),
-                    self.vars["raster_value_convention"].get(),
-                    messages.append,
-                )
-                for message in messages:
-                    self.log(message)
-            except (OSError, ValueError, rasterio.errors.RasterioError) as exc:
-                self.log(f"ERROR: {exc}")
-                messagebox.showerror(APP_NAME, str(exc), parent=self)
-
-        ttk.Button(parent, text="Select file...", command=browse).grid(
-            row=row, column=2, padx=6, pady=4
-        )
+        ttk.Button(parent, text=button_text, command=browse).grid(row=row, column=2, padx=6, pady=(4, 0))
+        status = tk.Label(parent, text="", anchor="w", justify="left", wraplength=560)
+        status.grid(row=row + 1, column=1, columnspan=3, sticky="w", padx=8, pady=(0, 4))
+        self._check_labels[key] = status
 
     def add_entry(self, parent, row, label, key, default):
-        ttk.Label(parent, text=label).grid(row=row, column=0, sticky="w", padx=6, pady=3)
+        self._label(parent, row, label, key)
         var = tk.StringVar(value=str(default))
         self.vars[key] = var
-        ttk.Entry(parent, textvariable=var).grid(row=row, column=1, sticky="ew", padx=6, pady=3)
+        entry = ttk.Entry(parent, textvariable=var)
+        entry.grid(row=row, column=1, sticky="ew", padx=6, pady=3)
+        self._help(entry, key)
+        return entry
 
-    def load_vector_layers(self, path_key, id_field_key, layer_key, combo):
+    def add_choice(self, parent, row, label, key, default, values, readonly=True):
+        self._label(parent, row, label, key)
+        var = tk.StringVar(value=default)
+        self.vars[key] = var
+        combo = ttk.Combobox(parent, textvariable=var, values=values, state="readonly" if readonly else "normal")
+        combo.grid(row=row, column=1, sticky="ew", padx=6, pady=3)
+        self._help(combo, key)
+        return combo
+
+    def add_check(self, parent, row, text, key, default, padx=6):
+        var = tk.StringVar(value="True" if default else "False")
+        self.vars[key] = var
+        box = ttk.Checkbutton(parent, text=text, variable=var, onvalue="True", offvalue="False")
+        box.grid(row=row, column=0, columnspan=3, sticky="w", padx=padx, pady=3)
+        self._help(box, key)
+        return box
+
+    def _report_raster(self, path):
+        """Log the raster's values and sign when it is picked (as before)."""
+        messages = []
         try:
-            layers, recommended = vector_layer_choices(
-                self.vars[path_key].get().strip(),
-                self.vars[id_field_key].get().strip(),
+            self.log("Validating selected bathymetric-difference raster...")
+            validate_bathymetric_difference_raster(
+                path,
+                self.vars["difference_units"].get(),
+                self.vars["source_sign"].get(),
+                self.vars["raster_value_convention"].get(),
+                messages.append,
             )
-            combo.configure(values=layers)
-            current = self.vars[layer_key].get().strip()
-            self.vars[layer_key].set(current if current in layers else recommended)
-        except Exception as exc:
-            messagebox.showerror(APP_NAME, str(exc))
+            for message in messages:
+                self.log(message)
+        except (OSError, ValueError, rasterio.errors.RasterioError) as exc:
+            self.log(f"ERROR: {exc}")
+            messagebox.showerror(APP_NAME, str(exc), parent=self)
+
+    # ----- input checks -------------------------------------------------
+    def _schedule_check(self, key, delay_ms=600):
+        job = self._check_jobs.pop(key, None)
+        if job is not None:
+            self.after_cancel(job)
+        self._check_jobs[key] = self.after(delay_ms, lambda: self._start_check(key))
+
+    def _start_check(self, key):
+        self._check_jobs.pop(key, None)
+        values = {name: var.get() for name, var in self.vars.items()}
+        serial = self._check_serial.get(key, 0) + 1
+        self._check_serial[key] = serial
+        if values.get(key, "").strip():
+            self._check_labels[key].configure(text="Checking...", foreground="grey40")
+
+        def work():
+            try:
+                result = check_input(key, values)
+            except Exception as exc:  # a check must never break the form
+                result = InputCheck(False, f"Could not check: {exc}")
+            self._check_queue.put((key, serial, result))
+
+        threading.Thread(target=work, name=f"check-{key}", daemon=True).start()
+
+    def _poll_checks(self):
+        while True:
+            try:
+                key, serial, result = self._check_queue.get_nowait()
+            except queue.Empty:
+                break
+            if serial == self._check_serial.get(key):
+                self._show_check(key, result)
+        self.after(200, self._poll_checks)
+
+    def _show_check(self, key, result):
+        self._check_results[key] = result
+        if result.ok is None:
+            text, colour = result.message, "grey40"
+        elif result.ok:
+            text, colour = "✓ " + result.message, "#1a7f37"
+        else:
+            text, colour = "✗ " + result.message, "#b42318"
+        self._check_labels[key].configure(text=text, foreground=colour)
+        layer_key = CHECK_LAYER_KEYS.get(key)
+        combo = self._layer_combos.get(key)
+        if layer_key and combo is not None and result.layers:
+            combo.configure(values=list(result.layers))
+            if not self.vars[layer_key].get().strip():
+                self.vars[layer_key].set(result.recommended_layer)
+
+    def input_problems(self):
+        """Inputs whose last check failed, as 'label: message' lines."""
+        names = {
+            "difference_raster": "Difference raster", "calibration_grid": "Calibration grid",
+            "licence_layer": "Licence polygons", "ems_source": "EMS source",
+            "output_folder": "Output folder", "model_path": "Model to update",
+        }
+        problems = []
+        for key, result in self._check_results.items():
+            if result.ok is False:
+                if key == "model_path" and self.vars["write_model_factors"].get() != "True":
+                    continue
+                problems.append(f"{names.get(key, key)}: {result.message}")
+        return problems
+
+    # ----- remembered settings -----------------------------------------
+    def _restore_settings(self):
+        saved = self._store.load()
+        for key, value in saved.get("values", {}).items():
+            if key in self.vars and value is not None:
+                self.vars[key].set(str(value))
+        if saved.get("advanced_open"):
+            self._toggle_advanced()
+
+    def _remember_settings(self):
+        self._store.save({
+            "values": {key: var.get() for key, var in self.vars.items()},
+            "advanced_open": self._advanced_open,
+        })
+
+    def _on_close(self):
+        self._remember_settings()
+        if self._cancel_event is not None:
+            self._cancel_event.set()
+        self.destroy()
+
+    def _toggle_advanced(self):
+        self._advanced_open = not self._advanced_open
+        if self._advanced_open:
+            self.advanced.grid()
+            self.advanced_button.configure(text="▾ Hide advanced settings")
+        else:
+            self.advanced.grid_remove()
+            self.advanced_button.configure(text="▸ Show advanced settings (EMS fields, QA thresholds)")
 
     def _build(self):
         canvas = tk.Canvas(self, highlightthickness=0)
@@ -5421,202 +5777,149 @@ class App(tk.Tk):
         files = ttk.LabelFrame(body, text="1. Input and output data")
         files.grid(row=0, column=0, sticky="ew", padx=10, pady=8)
         files.columnconfigure(1, weight=1)
-        self.add_difference_raster_path(files, 0)
-        self.add_path(files, 1, "Calibration grid", "calibration_grid")
-        self.add_path(files, 2, "Licence polygons", "licence_layer")
-        self.add_path(files, 3, "EMS file or root folder", "ems_source", directory=True)
+        self.add_path(
+            files, 0, "Bathymetric difference raster", "difference_raster",
+            filetypes=[
+                ("ESRI Binary Float Grid", "*.flt"),
+                ("Numeric raster datasets", "*.flt *.tif *.tiff"),
+                ("All files", "*.*"),
+            ],
+            title="Select bathymetric-difference raster",
+            on_pick=self._report_raster,
+        )
+        vector_types = [("GeoPackage", "*.gpkg"), ("GIS layers", "*.gpkg *.shp *.tab *.geojson"), ("All files", "*.*")]
+        self.add_path(files, 2, "Calibration grid", "calibration_grid", filetypes=vector_types)
+        self._layer_combos["calibration_grid"] = self.add_choice(
+            files, 4, "    Grid layer", "calibration_grid_layer", "", [])
+        self.add_entry(files, 5, "    Grid ID field", "grid_id_field", "GridID")
+        self.add_path(files, 6, "Licence polygons", "licence_layer", filetypes=vector_types)
+        self._layer_combos["licence_layer"] = self.add_choice(
+            files, 8, "    Licence layer", "licence_layer_name", "", [])
+        self.add_entry(files, 9, "    Licence number field", "licence_field", "LicenceNo")
+        self.add_path(files, 10, "EMS file or root folder", "ems_source", directory=True)
         ttk.Button(
             files,
             text="Select file...",
             command=lambda: self.vars["ems_source"].set(
-                filedialog.askopenfilename() or self.vars["ems_source"].get()
+                filedialog.askopenfilename(title="Select one EMS file") or self.vars["ems_source"].get()
             ),
-        ).grid(row=3, column=3, padx=3)
-        self.add_path(files, 4, "Output folder", "output_folder", directory=True)
-        ttk.Label(files, text="Validation resolution").grid(row=5, column=0, sticky="w", padx=6, pady=4)
-        self.vars["resolution_mode"] = tk.StringVar(value=RESOLUTION_250)
-        ttk.Combobox(
-            files,
-            textvariable=self.vars["resolution_mode"],
-            values=[RESOLUTION_250, RESOLUTION_50, RESOLUTION_BOTH],
-            state="readonly",
-        ).grid(row=5, column=1, sticky="ew", padx=6, pady=4)
-        ttk.Label(
-            files,
-            text="The selected calibration grid must be the 250 m regulatory master.",
-        ).grid(row=6, column=1, sticky="w", padx=6, pady=2)
-        ttk.Label(files, text="Calibration grid layer").grid(
-            row=7, column=0, sticky="w", padx=6, pady=4
+        ).grid(row=10, column=3, padx=3, pady=(4, 0))
+        self.add_path(files, 12, "Output folder", "output_folder", directory=True)
+        self.add_choice(
+            files, 14, "Validation resolution", "resolution_mode", RESOLUTION_250,
+            [RESOLUTION_250, RESOLUTION_50, RESOLUTION_BOTH],
         )
-        self.vars["calibration_grid_layer"] = tk.StringVar()
-        grid_layer_combo = ttk.Combobox(
-            files,
-            textvariable=self.vars["calibration_grid_layer"],
-            state="readonly",
-        )
-        grid_layer_combo.grid(row=7, column=1, sticky="ew", padx=6, pady=4)
-        ttk.Button(
-            files,
-            text="Load layers",
-            command=lambda: self.load_vector_layers(
-                "calibration_grid",
-                "grid_id_field",
-                "calibration_grid_layer",
-                grid_layer_combo,
-            ),
-        ).grid(row=7, column=2, padx=4)
-        ttk.Label(files, text="Licence polygon layer").grid(
-            row=8, column=0, sticky="w", padx=6, pady=4
-        )
-        self.vars["licence_layer_name"] = tk.StringVar()
-        licence_layer_combo = ttk.Combobox(
-            files,
-            textvariable=self.vars["licence_layer_name"],
-            state="readonly",
-        )
-        licence_layer_combo.grid(row=8, column=1, sticky="ew", padx=6, pady=4)
-        ttk.Button(
-            files,
-            text="Load layers",
-            command=lambda: self.load_vector_layers(
-                "licence_layer",
-                "licence_field",
-                "licence_layer_name",
-                licence_layer_combo,
-            ),
-        ).grid(row=8, column=2, padx=4)
-        ttk.Label(
-            files,
-            text=(
-                "For model write-back, select its areas layer and set Licence number field "
-                "to area_id; blank lowering_factor values are filled."
-            ),
-        ).grid(row=9, column=1, columnspan=4, sticky="w", padx=6, pady=2)
 
-        fields = ttk.LabelFrame(body, text="2. Fields and survey period")
-        fields.grid(row=1, column=0, sticky="ew", padx=10, pady=8)
-        fields.columnconfigure(1, weight=1)
-        entries = [
-            ("Grid ID field", "grid_id_field", "GridID"), ("Licence number field", "licence_field", "LicenceNo"),
-            ("EMS longitude/X field", "ems_x_field", "GPSLON"), ("EMS latitude/Y field", "ems_y_field", "GPSLAT"),
-            ("EMS date-time field", "ems_datetime_field", "DATETIME"), ("EMS dredge field", "ems_dredge_field", "DREDGE"),
-            ("EMS vessel field (optional)", "ems_vessel_field", "VESSEL"), ("Active dredge value", "ems_dredge_value", "3"),
-            ("Survey start, dd/mm/yyyy", "survey_start", ""), ("Survey end, dd/mm/yyyy", "survey_end", ""),
-            ("Calculation CRS", "projected_crs", "EPSG:27700"),
-        ]
-        for r, item in enumerate(entries): self.add_entry(fields, r, *item)
-        self.vars["ems_time_field"] = tk.StringVar(value="TIME")
-        ttk.Label(fields, text="EMS time field (when date and time are separate)").grid(row=11, column=0, sticky="w", padx=6, pady=3)
-        ttk.Entry(fields, textvariable=self.vars["ems_time_field"]).grid(row=11, column=1, sticky="ew", padx=6)
-        ttk.Label(fields, text="Dredge comparison").grid(row=12, column=0, sticky="w", padx=6, pady=3)
-        self.vars["ems_dredge_mode"] = tk.StringVar(value="equals")
-        ttk.Combobox(fields, textvariable=self.vars["ems_dredge_mode"], values=["equals", "greater_or_equal"], state="readonly").grid(row=12, column=1, sticky="ew", padx=6)
-        ttk.Label(fields, text="Lowering sign after value convention (single raster input)").grid(row=13, column=0, sticky="w", padx=6, pady=3)
-        self.vars["source_sign"] = tk.StringVar(value="positive_is_lowering")
-        ttk.Combobox(fields, textvariable=self.vars["source_sign"], values=["positive_is_lowering", "negative_is_lowering"], state="readonly").grid(row=13, column=1, sticky="ew", padx=6)
-        ttk.Label(fields, text="Raster value convention").grid(row=14, column=0, sticky="w", padx=6, pady=3)
-        self.vars["raster_value_convention"] = tk.StringVar(value="ELEVATION")
-        ttk.Combobox(fields, textvariable=self.vars["raster_value_convention"], values=["ELEVATION", "POSITIVE_DEPTH"], state="readonly").grid(row=14, column=1, sticky="ew", padx=6)
-        ttk.Label(fields, text="Bathymetric difference units").grid(row=15, column=0, sticky="w", padx=6, pady=3)
-        self.vars["difference_units"] = tk.StringVar(value="metres")
-        ttk.Combobox(fields, textvariable=self.vars["difference_units"], values=["metres"], state="readonly").grid(row=15, column=1, sticky="ew", padx=6)
-        ttk.Label(fields, text="Change tolerance (m)").grid(row=16, column=0, sticky="w", padx=6, pady=3)
-        self.vars["change_tolerance_m"] = tk.StringVar(value="0.05")
-        ttk.Entry(fields, textvariable=self.vars["change_tolerance_m"]).grid(row=16, column=1, sticky="ew", padx=6)
-        ttk.Label(fields, text="Validation mode").grid(row=17, column=0, sticky="w", padx=6, pady=3)
-        self.vars["validation_mode"] = tk.StringVar(value="DEEPENING_ONLY")
-        ttk.Combobox(fields, textvariable=self.vars["validation_mode"], values=["DEEPENING_ONLY", "NET_CHANGE", "TRACK_FOOTPRINT", "FOOTPRINT_AND_CONTROL_AREA"], state="readonly").grid(row=17, column=1, sticky="ew", padx=6)
-        ttk.Label(fields, text="Analysis extent").grid(row=18, column=0, sticky="w", padx=6, pady=3)
-        self.vars["analysis_extent"] = tk.StringVar(value="FULL_OVERLAP")
-        ttk.Combobox(fields, textvariable=self.vars["analysis_extent"], values=["TRACK_FOOTPRINT", "VALIDATION_POLYGON", "FULL_OVERLAP"], state="readonly").grid(row=18, column=1, sticky="ew", padx=6)
-        ttk.Label(fields, text="Background (natural) lowering correction").grid(row=20, column=0, sticky="w", padx=6, pady=3)
-        self.vars["background_correction"] = tk.StringVar(value="UNDREDGED_CELLS")
-        ttk.Combobox(fields, textvariable=self.vars["background_correction"], values=["UNDREDGED_CELLS", "NONE"], state="readonly").grid(row=20, column=1, sticky="ew", padx=6)
-        ttk.Label(fields, text="Minimum undredged cells for background").grid(row=21, column=0, sticky="w", padx=6, pady=3)
-        self.vars["background_min_cells"] = tk.StringVar(value="5")
-        ttk.Entry(fields, textvariable=self.vars["background_min_cells"]).grid(row=21, column=1, sticky="ew", padx=6)
-        ttk.Label(fields, text="Licence rate method").grid(row=22, column=0, sticky="w", padx=6, pady=3)
-        self.vars["rate_method"] = tk.StringVar(value="POOLED")
-        ttk.Combobox(fields, textvariable=self.vars["rate_method"], values=["POOLED", "CELL_FILTERS"], state="readonly").grid(row=22, column=1, sticky="ew", padx=6)
-        ttk.Label(fields, text="Licences to run (blank = all)").grid(row=23, column=0, sticky="w", padx=6, pady=3)
-        self.vars["licence_filter"] = tk.StringVar(value="")
-        ttk.Entry(fields, textvariable=self.vars["licence_filter"]).grid(row=23, column=1, sticky="ew", padx=6)
-        ttk.Button(fields, text="Choose...", command=self.choose_licences).grid(row=23, column=2, padx=4)
-        self.vars["reuse_ems_cache"] = tk.StringVar(value="True")
-        ttk.Checkbutton(
-            fields,
-            text="Reuse EMS data from an earlier run when EMS settings and dates match (much faster)",
-            variable=self.vars["reuse_ems_cache"],
-            onvalue="True",
-            offvalue="False",
-        ).grid(row=24, column=0, columnspan=3, sticky="w", padx=6, pady=3)
+        method = ttk.LabelFrame(body, text="2. Survey period and method")
+        method.grid(row=1, column=0, sticky="ew", padx=10, pady=8)
+        method.columnconfigure(1, weight=1)
+        self.add_entry(method, 0, "Survey start, dd/mm/yyyy", "survey_start", "")
+        self.add_entry(method, 1, "Survey end, dd/mm/yyyy", "survey_end", "")
+        self.add_choice(
+            method, 2, "Raster value convention", "raster_value_convention", "ELEVATION",
+            ["ELEVATION", "POSITIVE_DEPTH"],
+        )
+        self.add_choice(
+            method, 3, "Lowering sign", "source_sign", "positive_is_lowering",
+            ["positive_is_lowering", "negative_is_lowering"],
+        )
+        self.add_choice(
+            method, 4, "Background (natural) lowering", "background_correction", "UNDREDGED_CELLS",
+            ["UNDREDGED_CELLS", "NONE"],
+        )
+        self.add_choice(method, 5, "Licence rate method", "rate_method", "POOLED", ["POOLED", "CELL_FILTERS"])
+        self.add_entry(method, 6, "Licences to run (blank = all)", "licence_filter", "")
+        ttk.Button(method, text="Choose...", command=self.choose_licences).grid(row=6, column=2, padx=4)
+        self.add_check(
+            method, 7,
+            "Reuse EMS data from an earlier run when EMS settings and dates match (much faster)",
+            "reuse_ems_cache", True,
+        )
 
-        qa = ttk.LabelFrame(body, text="3. Calculation and QA settings")
-        qa.grid(row=2, column=0, sticky="ew", padx=10, pady=8)
-        qa.columnconfigure(1, weight=1)
-        numeric = [
-            ("Bulk density (t/m³)", "bulk_density", 1.7), ("EMS sample interval (minutes)", "sample_interval_minutes", 1.0),
-            ("Minimum EMS time per cell (hours)", "minimum_ems_hours", 0.5), ("Minimum raster coverage (%)", "minimum_coverage_percent", 80),
-            ("Minimum detectable lowering (m)", "minimum_detectable_change_m", 0.2), ("Maximum plausible rate (t/hour)", "maximum_rate_tph", 1500),
-            ("Configured EMS rate (t/hour)", "configured_rate_tph", 500), ("GREEN tolerance (%)", "green_tolerance_percent", 15),
-            ("AMBER tolerance (%)", "amber_tolerance_percent", 30),
-        ]
-        for r, item in enumerate(numeric): self.add_entry(qa, r, *item)
+        rates = ttk.LabelFrame(body, text="3. Rate comparison")
+        rates.grid(row=2, column=0, sticky="ew", padx=10, pady=8)
+        rates.columnconfigure(1, weight=1)
+        self.add_entry(rates, 0, "Configured EMS rate (t/hour)", "configured_rate_tph", 500)
+        self.add_entry(rates, 1, "Bulk density (t/m³)", "bulk_density", 1.7)
+        self.add_entry(rates, 2, "GREEN tolerance (%)", "green_tolerance_percent", 15)
+        self.add_entry(rates, 3, "AMBER tolerance (%)", "amber_tolerance_percent", 30)
 
         writeback = ttk.LabelFrame(body, text="4. Model write-back (optional)")
         writeback.grid(row=3, column=0, sticky="ew", padx=10, pady=8)
         writeback.columnconfigure(1, weight=1)
-        self.vars["write_model_factors"] = tk.StringVar(value="False")
-        ttk.Checkbutton(
-            writeback,
-            text="Write the validated 250 m lowering factor to the model "
-            "(fills blank lowering_factor values only)",
-            variable=self.vars["write_model_factors"],
-            onvalue="True",
-            offvalue="False",
-        ).grid(row=0, column=0, columnspan=3, sticky="w", padx=6, pady=3)
-        self.vars["replace_model_factors"] = tk.StringVar(value="False")
-        ttk.Checkbutton(
-            writeback,
-            text="Replace existing factors for the licences in this run "
-            "(asks before replacing; every change is recorded in lowering_factor_history)",
-            variable=self.vars["replace_model_factors"],
-            onvalue="True",
-            offvalue="False",
-        ).grid(row=5, column=0, columnspan=3, sticky="w", padx=24, pady=3)
-        ttk.Label(writeback, text="Model to update (write-back target)").grid(row=1, column=0, sticky="w", padx=6, pady=3)
-        self.vars["model_path"] = tk.StringVar(value="")
-        ttk.Entry(writeback, textvariable=self.vars["model_path"]).grid(row=1, column=1, sticky="ew", padx=6)
+        self.add_check(
+            writeback, 0,
+            "Write the validated 250 m lowering factor to the model (fills blank lowering_factor values)",
+            "write_model_factors", False,
+        )
+        self.add_check(
+            writeback, 1,
+            "Replace existing factors for the licences in this run "
+            "(asks first; every change is recorded in lowering_factor_history)",
+            "replace_model_factors", False, padx=24,
+        )
+        self.add_path(
+            writeback, 2, "Model to update", "model_path",
+            filetypes=[("GeoPackage", "*.gpkg"), ("All files", "*.*")],
+            title="Select the Lowering Model GeoPackage",
+        )
+        self._layer_combos["model_path"] = self.add_choice(
+            writeback, 4, "    Model layer", "model_layer", "areas", ["areas"])
+        self.add_entry(writeback, 5, "    Area ID field (matched to licence number)", "model_id_field", "area_id")
 
-        def browse_model():
-            value = filedialog.askopenfilename(
-                title="Select the Lowering Model GeoPackage",
-                filetypes=[("GeoPackage", "*.gpkg"), ("All files", "*.*")],
-            )
-            if value:
-                self.vars["model_path"].set(value)
+        self.advanced_button = ttk.Button(body, command=self._toggle_advanced)
+        self.advanced_button.grid(row=4, column=0, sticky="w", padx=10, pady=(4, 0))
+        self.advanced = ttk.Frame(body)
+        self.advanced.grid(row=5, column=0, sticky="ew")
+        self.advanced.columnconfigure(0, weight=1)
 
-        ttk.Button(writeback, text="Select file...", command=browse_model).grid(row=1, column=2, padx=4)
-        ttk.Label(writeback, text="Model layer").grid(row=2, column=0, sticky="w", padx=6, pady=3)
-        self.vars["model_layer"] = tk.StringVar(value="areas")
-        model_layer_combo = ttk.Combobox(writeback, textvariable=self.vars["model_layer"], state="readonly", values=["areas"])
-        model_layer_combo.grid(row=2, column=1, sticky="ew", padx=6)
-        ttk.Button(
-            writeback,
-            text="Load layers",
-            command=lambda: self.load_vector_layers("model_path", "model_id_field", "model_layer", model_layer_combo),
-        ).grid(row=2, column=2, padx=4)
-        ttk.Label(writeback, text="Model area ID field (matched to licence number)").grid(row=3, column=0, sticky="w", padx=6, pady=3)
-        self.vars["model_id_field"] = tk.StringVar(value="area_id")
-        ttk.Entry(writeback, textvariable=self.vars["model_id_field"]).grid(row=3, column=1, sticky="ew", padx=6)
-        ttk.Label(
-            writeback,
-            text="Leave 'Model to update' blank to write to the licence layer instead.",
-        ).grid(row=4, column=1, columnspan=2, sticky="w", padx=6, pady=(0, 3))
+        ems = ttk.LabelFrame(self.advanced, text="EMS track fields")
+        ems.grid(row=0, column=0, sticky="ew", padx=10, pady=8)
+        ems.columnconfigure(1, weight=1)
+        for row, item in enumerate([
+            ("EMS longitude/X field", "ems_x_field", "GPSLON"),
+            ("EMS latitude/Y field", "ems_y_field", "GPSLAT"),
+            ("EMS date-time field", "ems_datetime_field", "DATETIME"),
+            ("EMS time field (when date and time are separate)", "ems_time_field", "TIME"),
+            ("EMS dredge field", "ems_dredge_field", "DREDGE"),
+            ("EMS vessel field (optional)", "ems_vessel_field", "VESSEL"),
+            ("Active dredge value", "ems_dredge_value", "3"),
+        ]):
+            self.add_entry(ems, row, *item)
+        self.add_choice(ems, 7, "Dredge comparison", "ems_dredge_mode", "equals", ["equals", "greater_or_equal"])
+        self.add_entry(ems, 8, "EMS sample interval (minutes)", "sample_interval_minutes", 1.0)
+        self.add_entry(ems, 9, "Calculation CRS", "projected_crs", "EPSG:27700")
 
+        raster = ttk.LabelFrame(self.advanced, text="Raster and change")
+        raster.grid(row=1, column=0, sticky="ew", padx=10, pady=8)
+        raster.columnconfigure(1, weight=1)
+        self.add_choice(raster, 0, "Bathymetric difference units", "difference_units", "metres", ["metres"])
+        self.add_entry(raster, 1, "Change tolerance (m)", "change_tolerance_m", "0.05")
+        self.add_choice(
+            raster, 2, "Validation mode", "validation_mode", "DEEPENING_ONLY",
+            ["DEEPENING_ONLY", "NET_CHANGE", "TRACK_FOOTPRINT", "FOOTPRINT_AND_CONTROL_AREA"],
+        )
+        self.add_choice(
+            raster, 3, "Analysis extent", "analysis_extent", "FULL_OVERLAP",
+            ["TRACK_FOOTPRINT", "VALIDATION_POLYGON", "FULL_OVERLAP"],
+        )
+        self.add_entry(raster, 4, "Minimum undredged cells for background", "background_min_cells", "5")
+
+        qa = ttk.LabelFrame(self.advanced, text="QA thresholds")
+        qa.grid(row=2, column=0, sticky="ew", padx=10, pady=8)
+        qa.columnconfigure(1, weight=1)
+        for row, item in enumerate([
+            ("Minimum EMS time per cell (hours)", "minimum_ems_hours", 0.5),
+            ("Minimum raster coverage (%)", "minimum_coverage_percent", 80),
+            ("Minimum detectable lowering (m)", "minimum_detectable_change_m", 0.2),
+            ("Maximum plausible rate (t/hour)", "maximum_rate_tph", 1500),
+        ]):
+            self.add_entry(qa, row, *item)
+        self._advanced_open = True
+        self._toggle_advanced()  # start closed
 
         action = ttk.Frame(body)
-        action.grid(row=4, column=0, sticky="ew", padx=10, pady=8)
+        action.grid(row=6, column=0, sticky="ew", padx=10, pady=8)
         self.run_button = ttk.Button(action, text="Run validation", command=self.run)
         self.run_button.pack(side="left")
         self.cancel_button = ttk.Button(action, text="Cancel", command=self.cancel_run, state="disabled")
@@ -5626,7 +5929,7 @@ class App(tk.Tk):
         ttk.Button(action, text="Show last results", command=self.show_last_results).pack(side="left", padx=8)
 
         status = ttk.Frame(body)
-        status.grid(row=5, column=0, sticky="ew", padx=10, pady=(0, 4))
+        status.grid(row=7, column=0, sticky="ew", padx=10, pady=(0, 4))
         status.columnconfigure(1, weight=1)
         self.stage_label = ttk.Label(status, text="Ready.")
         self.stage_label.grid(row=0, column=0, sticky="w")
@@ -5636,7 +5939,7 @@ class App(tk.Tk):
         self.elapsed_label.grid(row=0, column=2, sticky="e")
 
         log_frame = ttk.LabelFrame(body, text="Processing log")
-        log_frame.grid(row=6, column=0, sticky="nsew", padx=10, pady=8)
+        log_frame.grid(row=8, column=0, sticky="nsew", padx=10, pady=8)
         self.logbox = tk.Text(log_frame, height=12, wrap="word")
         self.logbox.pack(fill="both", expand=True, padx=6, pady=6)
 
@@ -5667,14 +5970,23 @@ class App(tk.Tk):
     def run(self):
         if self._run_thread is not None and self._run_thread.is_alive():
             return
+        self._remember_settings()
         try:
-            self.logbox.delete("1.0", "end")
             settings = self.settings()
         except Exception as exc:
             self.log("ERROR: " + str(exc))
-            self.log(traceback.format_exc())
             messagebox.showerror(APP_NAME, str(exc))
             return
+        problems = self.input_problems()
+        if problems and not messagebox.askyesno(
+            APP_NAME,
+            "Some inputs have problems:\n\n" + "\n".join(f"\u2022 {p}" for p in problems)
+            + "\n\nRun anyway?",
+            icon="warning",
+            parent=self,
+        ):
+            return
+        self.logbox.delete("1.0", "end")
 
         self._run_messages = queue.Queue()
         self._cancel_event = threading.Event()
@@ -5966,6 +6278,8 @@ class App(tk.Tk):
             for key, value in data.as_dict().items():
                 if key in self.vars:
                     self.vars[key].set(str(value))
+            self._remember_settings()
+            self.log(f"Loaded settings from {path}")
         except Exception as exc:
             messagebox.showerror(APP_NAME, str(exc))
 

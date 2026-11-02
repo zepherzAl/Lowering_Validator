@@ -10,7 +10,7 @@ import time
 import pandas as pd
 import geopandas as gpd
 from pyproj import Transformer
-from ems_toolkit_common import SettingsStore, run_folder
+from ems_toolkit_common import SettingsStore, open_path, run_folder
 
 APP_ROOT = Path(__file__).resolve().parent
 if str(APP_ROOT) not in sys.path:
@@ -20,6 +20,7 @@ from ems_database import EMSDatabase, EMSRecord, discover_files, fallback_vessel
 from resolution_grid import create_aligned_child_grid, inspect_master_grid
 from lowering_model import (
     assign_points_to_areas,
+    factor_readiness,
     load_lowering_model,
     points_for_area,
     lowering_model_summary,
@@ -1289,6 +1290,9 @@ def run_lowering_workflow(
             "shared_overlap_records": area_shared,
             "250m_grid_cells_affected": 0,
             "50m_grid_cells_affected": 0,
+            "dredge_hours": 0.0,
+            "volume_m3": 0.0,
+            "max_lowering_m": 0.0,
             "warnings_errors": "; ".join(validation.area_errors.get(area_key, [])),
         }
         if area_points.empty:
@@ -1367,6 +1371,10 @@ def run_lowering_workflow(
             area_row[f"{'250m' if resolution_name == RESOLUTION_250 else '50m'}_grid_cells_affected"] = int(
                 (grid_out["point_count"] > 0).sum()
             )
+            if resolution_name == RESOLUTION_250 or resolution_mode == RESOLUTION_50:
+                area_row["dredge_hours"] = round(float(grid_out["time_hours"].sum()), 3)
+                area_row["volume_m3"] = round(float(grid_out["volume_m3"].sum()), 2)
+                area_row["max_lowering_m"] = round(float(grid_out["lowering_m"].max()), VALUE_DECIMALS)
 
         if not area_failed:
             area_row["areas_successfully_processed"] = 1
@@ -1376,6 +1384,7 @@ def run_lowering_workflow(
         else:
             area_row["250m_grid_cells_affected"] = 0
             area_row["50m_grid_cells_affected"] = 0
+            area_row["dredge_hours"] = area_row["volume_m3"] = area_row["max_lowering_m"] = 0.0
         area_row["warnings_errors"] = "; ".join(validation.area_errors.get(area_key, []))
         area_rows.append(area_row)
 
@@ -1402,6 +1411,9 @@ def run_lowering_workflow(
             ),
             "250m_grid_cells_affected": 0,
             "50m_grid_cells_affected": 0,
+            "dredge_hours": 0.0,
+            "volume_m3": 0.0,
+            "max_lowering_m": 0.0,
             "warnings_errors": "; ".join(issues) or "Area is not available for processing.",
         })
 
@@ -1444,6 +1456,9 @@ def run_lowering_workflow(
         "50m_grid_cells_affected": sum(
             row["50m_grid_cells_affected"] for row in area_rows
         ),
+        "dredge_hours": round(sum(row["dredge_hours"] for row in area_rows), 3),
+        "volume_m3": round(sum(row["volume_m3"] for row in area_rows), 2),
+        "max_lowering_m": max((row["max_lowering_m"] for row in area_rows), default=0.0),
         "warnings_errors": "; ".join(
             validation.errors
             + validation.warnings
@@ -1601,13 +1616,15 @@ class EMSLoweringApp(tk.Tk):
         )
         self.selected_area_id_var = tk.StringVar(value=self.saved_settings.get("selected_area_id", ""))
         self.model_summary_var = tk.StringVar(value="No Lowering Model loaded.")
-        self.dredge_mode_var = tk.StringVar(value="equals")
-        self.spatial_predicate_var = tk.StringVar(value="within")
+        self.model_issue_var = tk.StringVar(value="")
+        saved = self.saved_settings
+        self.dredge_mode_var = tk.StringVar(value=saved.get("dredge_mode", "equals"))
+        self.spatial_predicate_var = tk.StringVar(value=saved.get("spatial_predicate", "within"))
 
-        self.export_cleaned_csv_var = tk.BooleanVar(value=True)
-        self.export_points_gpkg_var = tk.BooleanVar(value=True)
-        self.export_grid_gpkg_var = tk.BooleanVar(value=True)
-        self.export_summary_csv_var = tk.BooleanVar(value=True)
+        self.export_cleaned_csv_var = tk.BooleanVar(value=saved.get("export_cleaned_csv", True))
+        self.export_points_gpkg_var = tk.BooleanVar(value=saved.get("export_points_gpkg", True))
+        self.export_grid_gpkg_var = tk.BooleanVar(value=saved.get("export_grid_gpkg", True))
+        self.export_summary_csv_var = tk.BooleanVar(value=saved.get("export_summary_csv", True))
 
         self.create_widgets()
         self.update_existing_grid_var.trace_add("write", lambda *_: self._toggle_dependent_inputs())
@@ -1615,6 +1632,17 @@ class EMSLoweringApp(tk.Tk):
         self._toggle_dependent_inputs()
         if self.model_path_var.get():
             self.refresh_model_summary(show_errors=False)
+        self.processing_mode_var.trace_add("write", lambda *_: self.refresh_model_issues())
+        self.selected_area_id_var.trace_add("write", lambda *_: self.refresh_model_issues())
+        self.protocol("WM_DELETE_WINDOW", self._on_close)
+
+    def show_finish_window(self, outputs):
+        _show_finish_window(self, outputs)
+
+    def _on_close(self):
+        self.save_settings()
+        self.cancel_event.set()
+        self.destroy()
 
     def set_app_icon(self):
         """Set the Tkinter window icon when running as .py or PyInstaller .exe."""
@@ -1705,9 +1733,14 @@ class EMSLoweringApp(tk.Tk):
         self.add_path_row(settings_frame, 0, "EMS track root folder", self.input_folder_var, self.browse_input_folder, "Browse folder")
         self.add_path_row(settings_frame, 1, "Lowering Model GeoPackage", self.model_path_var, self.browse_model_file, "Browse file")
         self.add_path_row(settings_frame, 2, "Output folder", self.output_folder_var, self.browse_output_folder, "Browse folder")
-        ttk.Label(settings_frame, textvariable=self.model_summary_var).grid(
-            row=3, column=0, columnspan=3, sticky="w", pady=(2, 8)
+        model_status = ttk.Frame(settings_frame)
+        model_status.grid(row=3, column=0, columnspan=3, sticky="ew", pady=(2, 8))
+        ttk.Label(model_status, textvariable=self.model_summary_var).pack(anchor="w")
+        self.model_issue_label = tk.Label(
+            model_status, textvariable=self.model_issue_var, anchor="w", justify="left",
+            wraplength=820, foreground="#b42318",
         )
+        self.model_issue_label.pack(anchor="w")
         ttk.Label(settings_frame, text="Processing mode").grid(
             row=4, column=0, sticky="w", padx=(0, 8), pady=5
         )
@@ -1876,11 +1909,38 @@ class EMSLoweringApp(tk.Tk):
             self.selected_area_combo.configure(values=active_ids)
             if self.selected_area_id_var.get() not in active_ids:
                 self.selected_area_id_var.set(active_ids[0] if active_ids else "")
+            self._loaded_model = (model_path, model, validation)
+            self.refresh_model_issues()
         except Exception as exc:
+            self._loaded_model = None
+            self.model_issue_var.set("")
             self.model_summary_var.set(f"Unable to load model: {exc}")
             self.selected_area_combo.configure(values=[])
             if show_errors:
                 messagebox.showerror("Lowering Model error", str(exc))
+
+    def model_readiness(self):
+        """("ok" | "warn" | "block", lines) for the loaded model and processing mode."""
+        loaded = getattr(self, "_loaded_model", None)
+        if not loaded or loaded[0] != self.model_path_var.get().strip():
+            self.refresh_model_summary(show_errors=False)
+            loaded = getattr(self, "_loaded_model", None)
+        if not loaded:
+            return "ok", []
+        _path, model, validation = loaded
+        selected = None
+        if self.processing_mode_var.get() == "Selected area":
+            selected = self.selected_area_id_var.get().strip() or None
+        return factor_readiness(model, validation, selected)
+
+    def refresh_model_issues(self):
+        loaded = getattr(self, "_loaded_model", None)
+        if not loaded:
+            self.model_issue_var.set("")
+            return
+        level, lines = self.model_readiness()
+        self.model_issue_var.set("" if level == "ok" else "\u26a0 " + " ".join(lines))
+        self.model_issue_label.configure(foreground="#b42318" if level == "block" else "#9a6700")
 
     def browse_existing_grid_file(self):
         file_path = filedialog.askopenfilename(
@@ -2032,6 +2092,12 @@ class EMSLoweringApp(tk.Tk):
             "selected_area_id": self.selected_area_id_var.get(),
             "existing_grid_path": self.existing_grid_path_var.get(),
             "update_existing_grid": self.update_existing_grid_var.get(),
+            "dredge_mode": self.dredge_mode_var.get(),
+            "spatial_predicate": self.spatial_predicate_var.get(),
+            "export_cleaned_csv": self.export_cleaned_csv_var.get(),
+            "export_points_gpkg": self.export_points_gpkg_var.get(),
+            "export_grid_gpkg": self.export_grid_gpkg_var.get(),
+            "export_summary_csv": self.export_summary_csv_var.get(),
         }
         self.settings_store.save(values)
 
@@ -2045,6 +2111,15 @@ class EMSLoweringApp(tk.Tk):
             settings = self.validate_inputs()
         except Exception as exc:
             messagebox.showerror("Input error", str(exc))
+            return
+        level, lines = self.model_readiness()
+        if level == "block":
+            messagebox.showerror("Lowering Model not ready", "\n\n".join(lines))
+            return
+        if level == "warn" and not messagebox.askyesno(
+            "Some areas will be skipped", "\n\n".join(lines) + "\n\nRun the other areas anyway?",
+            icon="warning",
+        ):
             return
 
         self.run_button.configure(state="disabled")
@@ -2064,16 +2139,101 @@ class EMSLoweringApp(tk.Tk):
 
     def run_processing(self, settings):
         try:
-            run_lowering_workflow(**settings, log_callback=self.safe_log, progress_callback=self.set_progress)
+            outputs = run_lowering_workflow(**settings, log_callback=self.safe_log, progress_callback=self.set_progress)
             self.after(0, lambda: self.status_var.set("Complete — see output paths in the log."))
-            self.after(0, lambda: messagebox.showinfo("Complete", "EMS lowering workflow completed successfully."))
+            self.after(0, lambda: self.show_finish_window(outputs))
         except Exception as exc:
             self.safe_log("")
-            self.safe_log(f"ERROR: {exc}")
-            self.after(0, lambda: messagebox.showerror("Processing error", str(exc)))
+            message = str(exc)
+            self.safe_log(f"ERROR: {message}")
+            if self.cancel_event.is_set():
+                self.after(0, lambda: self.status_var.set("Cancelled."))
+            else:
+                self.after(0, lambda: self.status_var.set("Failed — see the log."))
+                self.after(0, lambda: messagebox.showerror("Processing error", message))
         finally:
             self.after(0, lambda: self.run_button.configure(state="normal"))
             self.after(0, lambda: self.cancel_button.configure(state="disabled"))
+
+
+def finish_summary_rows(summary: pd.DataFrame) -> tuple[list[tuple], dict]:
+    """Per-area rows for the finish window, plus run totals."""
+    def number(value, default=0.0):
+        value = pd.to_numeric(pd.Series([value]), errors="coerce").iloc[0]
+        return default if pd.isna(value) else float(value)
+
+    areas = summary.loc[summary["summary_scope"].eq("area")]
+    rows = []
+    for _, row in areas.iterrows():
+        processed = number(row.get("areas_successfully_processed")) > 0
+        notes = str(row.get("warnings_errors") or "").strip()
+        if notes in ("nan", "None"):
+            notes = ""
+        factor = number(row.get("lowering_factor"), float("nan"))
+        rows.append((
+            str(row["area_id"]),
+            "Done" if processed else "Skipped",
+            "" if math.isnan(factor) else f"{factor:.6f}",
+            f"{number(row.get('dredge_hours')):,.1f}",
+            f"{number(row.get('volume_m3')):,.0f}",
+            f"{number(row.get('max_lowering_m')):.3f}",
+            f"{int(number(row.get('250m_grid_cells_affected'))):,}",
+            notes,
+        ))
+    totals = {
+        "processed": sum(1 for row in rows if row[1] == "Done"),
+        "skipped": sum(1 for row in rows if row[1] == "Skipped"),
+        "hours": float(pd.to_numeric(areas.get("dredge_hours"), errors="coerce").fillna(0).sum()) if "dredge_hours" in areas else 0.0,
+        "volume": float(pd.to_numeric(areas.get("volume_m3"), errors="coerce").fillna(0).sum()) if "volume_m3" in areas else 0.0,
+    }
+    return rows, totals
+
+
+def _show_finish_window(parent, outputs) -> None:
+    outputs = [Path(path) for path in outputs]
+    summary_path = next((p for p in outputs if p.name == "multi_area_processing_summary.csv"), None)
+    folder = summary_path.parent if summary_path else (outputs[0].parent if outputs else None)
+    window = tk.Toplevel(parent)
+    window.title("Lowering run complete")
+    window.transient(parent)
+    window.geometry("900x420")
+    rows, totals = [], {}
+    if summary_path and summary_path.exists():
+        try:
+            rows, totals = finish_summary_rows(pd.read_csv(summary_path, dtype={"area_id": str}))
+        except Exception as exc:
+            ttk.Label(window, text=f"Could not read the run summary: {exc}").pack(anchor="w", padx=12, pady=8)
+    if totals:
+        text = (
+            f"{totals['processed']} area(s) processed, {totals['skipped']} skipped. "
+            f"Dredging {totals['hours']:,.1f} hours, predicted volume {totals['volume']:,.0f} m\u00b3 "
+            "(shared overlap time is counted in each area)."
+        )
+        ttk.Label(window, text=text, wraplength=860).pack(anchor="w", padx=12, pady=(12, 6))
+    columns = ("area", "status", "factor", "hours", "volume", "max_lowering", "cells", "notes")
+    headings = ("Area", "Status", "Factor (m/h)", "Dredging h", "Volume m\u00b3", "Max lowering m", "250 m cells", "Notes")
+    frame = ttk.Frame(window)
+    frame.pack(fill="both", expand=True, padx=12)
+    tree = ttk.Treeview(frame, columns=columns, show="headings", height=12)
+    widths = (70, 70, 95, 85, 95, 105, 85, 300)
+    for column, heading, width in zip(columns, headings, widths):
+        tree.heading(column, text=heading)
+        tree.column(column, width=width, anchor="w" if column in ("area", "status", "notes") else "e", stretch=column == "notes")
+    tree.tag_configure("skipped", foreground="#b42318")
+    for row in rows:
+        tree.insert("", "end", values=row, tags=("skipped",) if row[1] == "Skipped" else ())
+    scroll = ttk.Scrollbar(frame, orient="vertical", command=tree.yview)
+    tree.configure(yscrollcommand=scroll.set)
+    tree.pack(side="left", fill="both", expand=True)
+    scroll.pack(side="right", fill="y")
+    buttons = ttk.Frame(window)
+    buttons.pack(fill="x", padx=12, pady=12)
+    if folder is not None:
+        ttk.Button(buttons, text="Open output folder", command=lambda: open_path(folder)).pack(side="left")
+    if summary_path is not None:
+        ttk.Button(buttons, text="Open summary CSV", command=lambda: open_path(summary_path)).pack(side="left", padx=8)
+    ttk.Button(buttons, text="Close", command=window.destroy).pack(side="right")
+    window.focus_set()
 
 
 if __name__ == "__main__":
