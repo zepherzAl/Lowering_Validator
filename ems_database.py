@@ -10,7 +10,7 @@ import tempfile
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime
-from pathlib import Path
+from pathlib import Path, PurePosixPath, PureWindowsPath
 from threading import Event
 from time import perf_counter
 from typing import Callable, Iterable, Iterator, Mapping
@@ -66,6 +66,20 @@ class EMSImportBatch:
     vector_conversion_seconds: float = 0.0
     parameter_build_seconds: float = 0.0
     vector_timings: Mapping[str, float] | None = None
+
+
+def fallback_vessel_name(source_path: str | os.PathLike[str]) -> str:
+    """Vessel name for EMS files without a vessel column.
+
+    Uses the file name, unless it has no letters (for example
+    "19-01-2022.txt" inside a "232003506 - (Welsh Piper)" folder), in which
+    case the parent folder name identifies the vessel.
+    """
+    text = os.fspath(source_path)
+    path = PureWindowsPath(text) if "\\" in text else PurePosixPath(text)
+    if any(character.isalpha() for character in path.stem):
+        return path.stem
+    return path.parent.name or path.stem
 
 
 def discover_files(
@@ -1282,6 +1296,63 @@ class EMSDatabase:
             cancel_event=cancel_event,
             progress_callback=progress_callback,
         )
+
+    def repair_fallback_vessels(
+        self,
+        profile: str,
+        log: Callable[[str], None] | None = None,
+    ) -> int:
+        """Rename rows that took a date-only file name as their vessel.
+
+        Older imports used the file name for every file without a vessel
+        column, so same-named files from different vessel folders were merged
+        into one vessel. Each file is fixed in its own transaction and files
+        already fixed are skipped, so this is safe to interrupt and re-run.
+        """
+        root = str(self.source_root)
+        with self._connection() as connection:
+            paths = [
+                row["source_path"]
+                for row in connection.execute(
+                    "SELECT source_path FROM source_files "
+                    "WHERE source_root = ? AND profile = ? AND status = 'ready'",
+                    (root, profile),
+                )
+            ]
+        updated = 0
+        for source_path in paths:
+            text = str(source_path)
+            path = PureWindowsPath(text) if "\\" in text else PurePosixPath(text)
+            old_name = path.stem
+            new_name = fallback_vessel_name(text)
+            if new_name == old_name:
+                continue
+            with self._connection() as connection:
+                sample = connection.execute(
+                    "SELECT vessel FROM ems_records WHERE source_root = ? "
+                    "AND profile = ? AND source_path = ? LIMIT 1",
+                    (root, profile, source_path),
+                ).fetchone()
+                if sample is None or sample["vessel"] != old_name:
+                    continue
+                if log is not None:
+                    log(
+                        f"Repairing EMS vessel name for {text}: "
+                        f"'{old_name}' -> '{new_name}' (one-time update)..."
+                    )
+                started = perf_counter()
+                changed = connection.execute(
+                    "UPDATE ems_records SET vessel = ? WHERE source_root = ? "
+                    "AND profile = ? AND source_path = ? AND vessel = ?",
+                    (new_name, root, profile, source_path, old_name),
+                ).rowcount
+            updated += changed
+            if log is not None:
+                log(
+                    f"Renamed {changed:,} EMS records in "
+                    f"{perf_counter() - started:.1f} sec."
+                )
+        return updated
 
     def record_count(self, profile: str) -> int:
         with self._connection() as connection:

@@ -64,6 +64,7 @@ from ems_database import (
     EMSImportBatch,
     EMSRecord,
     discover_files,
+    fallback_vessel_name,
     set_configured_database_path,
     validate_database,
 )
@@ -865,7 +866,7 @@ def _iter_validator_delimited_records(file: Path, settings: Settings):
         )
         dredges = df[dredge_col]
         dredge_numerics = pd.to_numeric(dredges, errors="coerce")
-        vessels = df[vessel_col] if vessel_col else [file.stem] * len(df)
+        vessels = df[vessel_col] if vessel_col else [fallback_vessel_name(file)] * len(df)
         valid_coordinates = xs.notna() & ys.notna()
         for x, y, timestamp, dredge, dredge_numeric, vessel, valid in zip(
             xs, ys, timestamps, dredges, dredge_numerics, vessels, valid_coordinates
@@ -1226,7 +1227,7 @@ def _iter_validator_delimited_batches(
                         else float(numeric_values[position])
                     ),
                     (
-                        file.stem
+                        fallback_vessel_name(file)
                         if vessel_values is None
                         else vessel_values[position]
                     ),
@@ -1284,7 +1285,7 @@ def _iter_validator_vector_records(file: Path, settings: Settings):
         gdf.geometry,
         timestamps,
         gdf[dredge_col],
-        gdf[vessel_col] if vessel_col else [file.stem] * len(gdf),
+        gdf[vessel_col] if vessel_col else [fallback_vessel_name(file)] * len(gdf),
     ):
         if geometry is None or geometry.is_empty or geometry.geom_type != "Point":
             continue
@@ -1604,6 +1605,8 @@ def load_ems(
         profile_crs=profile_crs,
     )
     log("EMS index synchronization complete; preparing the survey record query...")
+    if source_kind == "delimited":
+        database.repair_fallback_vessels(profile, log=log)
 
     log("Preparing survey EMS query...")
     started = time.perf_counter()
