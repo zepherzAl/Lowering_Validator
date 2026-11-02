@@ -67,7 +67,11 @@ from ems_database import (
     set_configured_database_path,
     validate_database,
 )
-from resolution_grid import create_aligned_child_grid, inspect_master_grid
+from resolution_grid import (
+    create_aligned_child_grid,
+    full_cell_mask,
+    inspect_master_grid,
+)
 
 APP_NAME = "Lowering Factor Calibration and Validation Tool"
 VERSION = "1.0.0"
@@ -457,6 +461,40 @@ def read_vector(
     if gdf.crs is None:
         raise ValueError(f"Vector layer has no CRS: {path}")
     return gdf
+
+
+def drop_partial_cells(
+    grid: gpd.GeoDataFrame,
+    grid_id_column: str,
+    projected_crs: str,
+    log: Callable[[str], None],
+    *,
+    cell_size_m: float = 250.0,
+    label: str = "calibration grid",
+) -> gpd.GeoDataFrame:
+    """Remove features that are not complete cell_size_m squares, and log them."""
+    check = grid
+    if not CRS.from_user_input(grid.crs).is_projected:
+        check = grid.to_crs(projected_crs)
+    full = np.asarray(full_cell_mask(check, cell_size_m), dtype=bool)
+    if full.all():
+        return grid
+    dropped_ids = grid.loc[~full, grid_id_column].astype(str).tolist()
+    kept = grid.loc[full].copy()
+    if kept.empty:
+        raise ValueError(
+            f"The {label} has no complete {cell_size_m:g} x {cell_size_m:g} m "
+            f"cells: all {len(grid):,} features are clipped or not "
+            f"{cell_size_m:g} m squares. Select the unclipped master grid."
+        )
+    shown = ", ".join(dropped_ids[:30])
+    more = f" and {len(dropped_ids) - 30:,} more" if len(dropped_ids) > 30 else ""
+    log(
+        f"Removed {len(dropped_ids):,} of {len(grid):,} {label} cells that are "
+        f"not complete {cell_size_m:g} x {cell_size_m:g} m squares "
+        f"(GridIDs: {shown}{more})."
+    )
+    return kept
 
 
 def inspect_authoritative_master_grid(
@@ -4147,6 +4185,13 @@ def run_validation(
         grid_id_column = field_lookup(
             alignment_grid.columns, settings.grid_id_field
         )
+        alignment_grid = drop_partial_cells(
+            alignment_grid,
+            grid_id_column,
+            settings.projected_crs,
+            log,
+            label="master grid layer",
+        )
         layout = inspect_authoritative_master_grid(
             alignment_grid,
             grid_id_column,
@@ -4182,6 +4227,13 @@ def run_validation(
                 settings.calibration_grid_layer,
                 bbox=grid_bbox,
             )
+            master_grid = drop_partial_cells(
+                master_grid,
+                grid_id_column,
+                settings.projected_crs,
+                log,
+                label="working grid",
+            )
         else:
             master_grid = alignment_grid
         log(
@@ -4198,6 +4250,13 @@ def run_validation(
         )
         grid_id_column = field_lookup(
             master_grid.columns, settings.grid_id_field
+        )
+        master_grid = drop_partial_cells(
+            master_grid,
+            grid_id_column,
+            settings.projected_crs,
+            log,
+            label="calibration grid",
         )
 
     licences = read_vector(

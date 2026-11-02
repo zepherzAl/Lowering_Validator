@@ -288,6 +288,10 @@ LIMITATIONS IN VERSION 1.0
 - Raster valid area is estimated from valid pixel count and pixel area.
 - EMS interval time is represented by retained sample count x sampling interval.
 - Each grid cell is assigned to the licence containing its representative point.
+- Grid cells that are not complete 250 x 250 m squares (within 1 m on each
+  side and 200 m2 in area), such as cells clipped to a survey or licence
+  boundary, are removed before both the 250 m and 50 m runs. The log lists the
+  removed GridIDs. If no complete cells remain, the run stops.
 - The JSON profile is not cryptographically signed.
 
 LOWERING MODEL FACTOR UPDATE

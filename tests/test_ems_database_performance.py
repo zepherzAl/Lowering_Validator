@@ -679,8 +679,8 @@ class ExperimentalResolutionTests(unittest.TestCase):
             )
         )
 
-    def test_clipped_source_features_recover_authoritative_full_parent_cells(self):
-        clip = box(100, 100, 400, 400)
+    def test_clipped_cells_are_removed_before_building_children(self):
+        clip = box(100, 100, 500, 500)
         source_parents = gpd.GeoDataFrame(
             {
                 "GridID": [
@@ -691,17 +691,30 @@ class ExperimentalResolutionTests(unittest.TestCase):
                 ]
             },
             geometry=[
-                box(0, 0, 250, 250).intersection(clip),
+                box(0, 0, 250, 250),
                 box(250, 0, 500, 250).intersection(clip),
                 box(0, 250, 250, 500).intersection(clip),
-                box(250, 250, 500, 500).intersection(clip),
+                box(250, 250, 500, 500),
             ],
             crs="EPSG:27700",
         )
+        messages = []
 
-        layout = inspect_master_grid(source_parents, "GridID")
+        kept = validator.drop_partial_cells(
+            source_parents, "GridID", "EPSG:27700", messages.append
+        )
+
+        self.assertEqual(kept["GridID"].tolist(), ["parent-sw", "parent-ne"])
+        self.assertTrue(
+            any(
+                "Removed 2 of 4" in message
+                and "parent-se, parent-nw" in message
+                for message in messages
+            )
+        )
+        layout = inspect_master_grid(kept, "GridID")
         children = create_aligned_child_grid(
-            source_parents.iloc[[0]], layout, child_size_m=50
+            kept.iloc[[0]], layout, child_size_m=50
         )
 
         self.assertEqual(len(children), 25)
@@ -709,6 +722,22 @@ class ExperimentalResolutionTests(unittest.TestCase):
         self.assertTrue(children.geometry.area.eq(2_500).all())
         self.assertAlmostEqual(children.geometry.area.sum(), 62_500)
         self.assertEqual(children.geometry.total_bounds.tolist(), [0.0, 0.0, 250.0, 250.0])
+
+    def test_grid_with_only_clipped_cells_is_rejected(self):
+        clip = box(100, 100, 400, 400)
+        clipped = gpd.GeoDataFrame(
+            {"GridID": ["parent-sw", "parent-ne"]},
+            geometry=[
+                box(0, 0, 250, 250).intersection(clip),
+                box(250, 250, 500, 500).intersection(clip),
+            ],
+            crs="EPSG:27700",
+        )
+
+        with self.assertRaisesRegex(ValueError, "no complete 250 x 250 m cells"):
+            validator.drop_partial_cells(
+                clipped, "GridID", "EPSG:27700", lambda _: None
+            )
 
     def test_adjacent_parent_children_share_exact_boundaries(self):
         parents = gpd.GeoDataFrame(
@@ -970,7 +999,6 @@ class ExperimentalResolutionTests(unittest.TestCase):
         update_model.assert_not_called()
 
     def test_full_overlap_inspects_full_master_before_loading_filtered_parents(self):
-        clip = box(100, 100, 400, 400)
         complete_grid = gpd.GeoDataFrame(
             {
                 "GridID": [
@@ -978,13 +1006,15 @@ class ExperimentalResolutionTests(unittest.TestCase):
                     "parent-se",
                     "parent-nw",
                     "parent-ne",
+                    "edge-clipped",
                 ]
             },
             geometry=[
-                box(0, 0, 250, 250).intersection(clip),
-                box(250, 0, 500, 250).intersection(clip),
-                box(0, 250, 250, 500).intersection(clip),
-                box(250, 250, 500, 500).intersection(clip),
+                box(0, 0, 250, 250),
+                box(250, 0, 500, 250),
+                box(0, 250, 250, 500),
+                box(250, 250, 500, 500),
+                box(500, 0, 600, 250),
             ],
             crs="EPSG:27700",
         )
@@ -1063,6 +1093,13 @@ class ExperimentalResolutionTests(unittest.TestCase):
             ),
         )
         self.assertTrue(any("Master grid origin: X=0.000, Y=0.000" in message for message in messages))
+        self.assertTrue(
+            any(
+                "Removed 1 of 5 master grid layer cells" in message
+                and "edge-clipped" in message
+                for message in messages
+            )
+        )
         self.assertTrue(
             any("Survey/raster candidate parent cells: 1" in message for message in messages)
         )

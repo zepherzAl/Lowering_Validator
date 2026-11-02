@@ -304,6 +304,14 @@ def _parent_affine_frame(geometry: BaseGeometry, cell_size_m: float) -> tuple[fl
     return (float(origin[0]), float(origin[1]), float(ux), float(uy), float(vx), float(vy))
 
 
+def full_cell_mask(grid: gpd.GeoDataFrame, cell_size_m: float = 250.0) -> list[bool]:
+    """True for each feature that is a complete cell_size_m square (within 1 m / 200 m2)."""
+    return [
+        _parent_affine_frame(geometry, cell_size_m) is not None
+        for geometry in grid.geometry
+    ]
+
+
 def _independent_parent_layout(grid: gpd.GeoDataFrame, grid_id_column: str, cell_size_m: float, log: Callable[[str], None] | None) -> MasterGridLayout | None:
     """Handle a transformed national grid whose local angle varies spatially."""
     geometries = tuple(grid.geometry)
