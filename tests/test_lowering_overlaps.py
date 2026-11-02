@@ -121,5 +121,39 @@ class WorkflowOverlapTests(unittest.TestCase):
         self.assertTrue(any("double-counts" in message for message in messages))
 
 
+
+class SameNamedVesselFileTests(unittest.TestCase):
+    """2022 archive: each vessel's file is 19-01-2022.txt inside its own folder."""
+
+    def test_vessels_dredging_at_the_same_time_are_both_counted(self):
+        from ems_database import EMSDatabase
+
+        header = "DATE,TIME,GPSLAT,GPSLON,DREDGE\n"
+        rows = "".join(
+            f"01/06/2022,10:{minute:02d}:{second:02d},50.59,-1.55,3\n"
+            for minute in range(5)
+            for second in (0, 10, 20, 30, 40, 50)
+        )
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder) / "Tracks"
+            for vessel in ("232003506 - (Welsh Piper)", "232215000 - (Sand Falcon)"):
+                path = root / "2022" / "1" / vessel / "19-01-2022.txt"
+                path.parent.mkdir(parents=True)
+                path.write_text(header + rows, encoding="utf-8")
+            database_path = Path(folder) / "index.sqlite3"
+            with patch.object(
+                lowerer, "EMSDatabase", lambda source: EMSDatabase(source, database_path)
+            ):
+                combined, *_ = lowerer.process_all_tracks(
+                    input_folder=root, dredge_value=3, dredge_mode="equals", sample_minutes=1
+                )
+        # 5 minutes x 2 vessels; merging by file name would give only 5.
+        self.assertEqual(len(combined), 10)
+        self.assertEqual(
+            sorted(combined["vessel"].unique()),
+            ["232003506 - (Welsh Piper)", "232215000 - (Sand Falcon)"],
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

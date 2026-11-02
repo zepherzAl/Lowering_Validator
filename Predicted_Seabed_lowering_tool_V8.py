@@ -16,7 +16,7 @@ APP_ROOT = Path(__file__).resolve().parent
 if str(APP_ROOT) not in sys.path:
     sys.path.insert(0, str(APP_ROOT))
 
-from ems_database import EMSDatabase, EMSRecord, discover_files
+from ems_database import EMSDatabase, EMSRecord, discover_files, fallback_vessel_name
 from resolution_grid import create_aligned_child_grid, inspect_master_grid
 from lowering_model import (
     assign_points_to_areas,
@@ -92,16 +92,22 @@ def _iter_lowerer_ems_records(file_path: Path):
             x=None if pd.isna(longitude) else float(longitude),
             y=None if pd.isna(latitude) else float(latitude),
             dredge=None if pd.isna(dredge) else str(dredge),
-            vessel=file_path.name,
+            vessel=fallback_vessel_name(file_path),
             crs=INPUT_CRS,
         )
 
 
 def sample_to_interval(df: pd.DataFrame, sample_minutes: int) -> pd.DataFrame:
-    """Reduce EMS records to one point per selected interval."""
-    df = df.sort_values(["source_file", "datetime"]).copy()
+    """Reduce EMS records to one point per file per selected interval.
+
+    Files are told apart by their full path: the 2020-2022 archive names every
+    vessel's file by date (e.g. 19-01-2022.txt in a per-vessel folder), so
+    grouping by file name merged vessels dredging at the same time.
+    """
+    key = "source_path" if "source_path" in df.columns else "source_file"
+    df = df.sort_values([key, "datetime"]).copy()
     df["sample_bin"] = df["datetime"].dt.floor(f"{sample_minutes}min")
-    sampled = df.groupby(["source_file", "sample_bin"], as_index=False).first()
+    sampled = df.groupby([key, "sample_bin"], as_index=False).first()
     sampled = sampled.drop(columns=["sample_bin"])
     return sampled
 
@@ -188,6 +194,7 @@ def process_all_tracks(
         ],
     )
     df["source_file"] = df["source_path"].map(lambda value: Path(str(value)).name)
+    df["vessel"] = df["source_path"].map(fallback_vessel_name)
     df["datetime"] = pd.to_datetime(df["timestamp"], errors="coerce")
     df[LAT_COL] = pd.to_numeric(df["y"], errors="coerce")
     df[LON_COL] = pd.to_numeric(df["x"], errors="coerce")
@@ -209,7 +216,7 @@ def process_all_tracks(
     sample_keys = list(zip(sampled["source_path"], sampled["row_number"]))
     candidate_mask = [key in candidate_keys for key in sample_keys]
     candidates = sampled.loc[candidate_mask].copy()
-    output_columns = ["source_file", "datetime", LAT_COL, LON_COL, DREDGE_COL]
+    output_columns = ["source_file", "vessel", "datetime", LAT_COL, LON_COL, DREDGE_COL]
     combined = sampled[output_columns].copy()
     candidates = candidates[output_columns].copy()
 
