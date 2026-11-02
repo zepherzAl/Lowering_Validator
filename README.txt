@@ -140,11 +140,20 @@ uses SQLite's progress handler and does not change query behavior otherwise.
 
 RASTER SIGN
 -----------
-Choose positive_is_lowering when positive raster values represent seabed
-lowering, or negative_is_lowering when negative raster values represent seabed
-lowering. The raster value convention (ELEVATION or POSITIVE_DEPTH) is applied
-as configured; the Validator does not infer a sign, take absolute values, or
-silently invert data. The output ObsLower_m is always positive for lowering.
+The raster value convention is applied first: ELEVATION values are used as
+they are, and POSITIVE_DEPTH values are negated so they behave like elevations.
+The lowering sign then says which sign means seabed lowering AFTER that step.
+
+  Raster                                   Convention       Lowering sign
+  Elevation, earlier minus later           ELEVATION        positive_is_lowering
+  Elevation, later minus earlier           ELEVATION        negative_is_lowering
+  Positive depth, later minus earlier      POSITIVE_DEPTH   negative_is_lowering
+  Positive depth, earlier minus later      POSITIVE_DEPTH   positive_is_lowering
+
+Check the "Bathymetric difference convention" line in the raster summary: it
+states which raw raster sign will be treated as lowering. The Validator does
+not infer a sign, take absolute values, or silently invert data. The output
+ObsLower_m is always positive for lowering.
 
 CALCULATIONS
 ------------
@@ -155,6 +164,18 @@ Observed lowering factor = observed lowering / EMS hours
 
 Licence rate is calculated from total accepted volume / total accepted EMS hours,
 then converted to tonnes/hour using the entered bulk density.
+
+Cells rejected by the QA filters lose their volume and their EMS hours. Because
+cells with lowering below the detection threshold are rejected, this can raise
+the validated rate. For comparison the summary also reports
+AllEMSCellsRate_tph (every cell with EMS time and valid bathymetry),
+AllEMSCellsHours and ExcludedEMSHoursPct. The log warns when the filters remove
+more than 25% of a licence's EMS hours.
+
+EMS hours = sampled records x EMS sample interval. The sample interval must
+match how often EMS logs records. The log reports the median gap between
+consecutive active records and warns when it is more than 1.5x the configured
+interval, because that would overstate every rate.
 
 QA CLASSES
 ----------
@@ -271,9 +292,16 @@ LIMITATIONS IN VERSION 1.0
 
 LOWERING MODEL FACTOR UPDATE
 ----------------------------
-When the selected licence polygon layer is a GeoPackage containing a
-`lowering_factor` field, the Validator writes its 250 m regulatory result back
-to that layer. It matches the validation licence ID to the configured licence
+Write-back is OFF by default. Switch on "Fill blank lowering_factor values"
+in the GUI, set "write_model_factors": true in a settings file, or pass
+--write-model-factors on the command line. Review the results first: a filled
+factor is never overwritten by later runs. The log lists each candidate rate
+with its QA status. (QA status compares against the configured rate, so a RED
+rate is not necessarily wrong data.)
+
+When write-back is on and the selected licence polygon layer is a GeoPackage
+containing a `lowering_factor` field, the Validator writes its 250 m regulatory
+result back to that layer. It matches the validation licence ID to the configured licence
 field (for the Lowering Model, `areas.area_id`) and stores
 `ValidatedRate_m3ph / 62,500` as metres/hour, matching the Lowerer's factor for
 a 250 m cell. Existing nonblank factor values are preserved; only blank or NULL

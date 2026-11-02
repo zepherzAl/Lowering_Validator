@@ -14,6 +14,7 @@ Positive standardised change means seabed lowering.
 from __future__ import annotations
 
 import argparse
+import collections
 import itertools
 import json
 import math
@@ -122,6 +123,7 @@ class Settings:
     configured_rate_tph: float = 500.0
     projected_crs: str = "EPSG:27700"
     resolution_mode: str = RESOLUTION_250
+    write_model_factors: bool = False
 
     @classmethod
     def from_dict(cls, data: dict) -> "Settings":
@@ -223,6 +225,8 @@ class Settings:
             raise ValueError("Change detection tolerance cannot be negative.")
         if self.ems_dredge_mode not in {"equals", "greater_or_equal"}:
             raise ValueError("Dredge comparison mode must be 'equals' or 'greater_or_equal'.")
+        if not isinstance(self.write_model_factors, bool):
+            raise ValueError("write_model_factors must be true or false.")
 
         try:
             CRS.from_user_input(self.projected_crs)
@@ -269,7 +273,15 @@ def parse_cli_settings(argv: Optional[list[str]] = None) -> Settings:
     parser.add_argument("--ems-vessel-field", type=str, default=None)
     parser.add_argument("--survey-start", type=str, default=None)
     parser.add_argument("--survey-end", type=str, default=None)
-    parser.add_argument("--source-sign", choices=["positive_is_lowering", "negative_is_lowering"], default=None)
+    parser.add_argument(
+        "--source-sign",
+        choices=["positive_is_lowering", "negative_is_lowering"],
+        default=None,
+        help=(
+            "Which sign means seabed lowering AFTER the raster value convention "
+            "is applied (POSITIVE_DEPTH values are negated first)."
+        ),
+    )
     parser.add_argument("--raster-value-convention", choices=["ELEVATION", "POSITIVE_DEPTH"], default=None)
     parser.add_argument("--difference-units", choices=["metres"], default=None)
     parser.add_argument("--change-tolerance-m", type=float, default=None)
@@ -289,6 +301,16 @@ def parse_cli_settings(argv: Optional[list[str]] = None) -> Settings:
         "--resolution-mode",
         choices=[RESOLUTION_250, RESOLUTION_50, RESOLUTION_BOTH],
         default=None,
+    )
+    parser.add_argument(
+        "--write-model-factors",
+        action="store_const",
+        const=True,
+        default=None,
+        help=(
+            "Fill blank lowering_factor values in the licence GeoPackage from "
+            "the 250 m validated rates. Off unless this flag is given."
+        ),
     )
     args = parser.parse_args(argv)
 
@@ -375,6 +397,7 @@ def parse_cli_settings(argv: Optional[list[str]] = None) -> Settings:
         "configured_rate_tph": args.configured_rate_tph,
         "projected_crs": args.projected_crs,
         "resolution_mode": args.resolution_mode,
+        "write_model_factors": args.write_model_factors,
     }
     for field_name, value in cli_overrides.items():
         if value is not None:
@@ -1294,6 +1317,41 @@ def _transform_bounds_by_crs(
     }
 
 
+def _counter_median(counts: "collections.Counter[int]") -> float | None:
+    total = sum(counts.values())
+    if not total:
+        return None
+    running = 0
+    for value in sorted(counts):
+        running += counts[value]
+        if running * 2 >= total:
+            return float(value)
+    return None
+
+
+def check_ems_logging_interval(
+    median_gap_seconds: float | None,
+    sample_interval_seconds: int,
+    log: Callable[[str], None],
+) -> None:
+    """Warn when EMS records are further apart than the configured interval."""
+    if median_gap_seconds is None:
+        log("EMS logging interval check: not enough consecutive records to measure it.")
+        return
+    log(
+        f"EMS logging interval check: median gap between consecutive active "
+        f"records {median_gap_seconds:g} sec; configured sample interval "
+        f"{sample_interval_seconds:g} sec."
+    )
+    if median_gap_seconds > sample_interval_seconds * 1.5:
+        log(
+            "WARNING: EMS records are logged less often than the configured "
+            "sample interval, so EMS hours are understated and rates overstated "
+            f"by about {median_gap_seconds / sample_interval_seconds:.1f}x. "
+            "Set the EMS sample interval to match the logging interval."
+        )
+
+
 def _query_sampled_ems(
     database: EMSDatabase,
     profile: str,
@@ -1312,6 +1370,9 @@ def _query_sampled_ems(
 ) -> dict[str, object]:
     spatial_first = query_bounds_by_crs is not None
     state: list[object] = [object(), None]
+    gap_counts: collections.Counter[int] = collections.Counter()
+    previous_vessel: object = object()
+    previous_timestamp: pd.Timestamp | None = None
     retained: list[dict[str, object]] = []
     active_count = 0
     rows_streamed = 0
@@ -1386,6 +1447,15 @@ def _query_sampled_ems(
                 continue
 
             active_count += 1
+            if (
+                previous_timestamp is not None
+                and record["vessel"] == previous_vessel
+            ):
+                gap = int(round((timestamp - previous_timestamp).total_seconds()))
+                if gap > 0:
+                    gap_counts[gap] += 1
+            previous_vessel = record["vessel"]
+            previous_timestamp = timestamp
             if not _is_first_time_bin_sample(
                 record, timestamp, seconds, state
             ):
@@ -1429,6 +1499,7 @@ def _query_sampled_ems(
     )
     return {
         "retained": retained,
+        "median_gap_seconds": _counter_median(gap_counts),
         "active_count": active_count,
         "rows_streamed": rows_streamed,
         "sampled_candidates": sampled_candidates,
@@ -1589,7 +1660,6 @@ def load_ems(
         "log": log,
     }
     log("Current pathway: date/dredge filters, vessel/time ordering, then sampling.")
-    log("Known production baseline time to first EMS row: 863.6 sec (reported).")
     current_result = _query_sampled_ems(
         database,
         profile,
@@ -1598,6 +1668,9 @@ def load_ems(
         label="Current pathway",
     )
     retained = current_result["retained"]
+    check_ems_logging_interval(
+        current_result["median_gap_seconds"], seconds, log
+    )
     if current_result["active_count"] == 0:
         raise ValueError("No active EMS records remain after dredge and date filtering.")
 
@@ -3814,6 +3887,29 @@ def _run_validation_single(
                     if np.isfinite(rate_tph) and settings.configured_rate_tph > 0 else np.nan)
         mandatory_ok = len(accepted) > 0 and total_hours > 0
         area_status = status_for_difference(diff_pct, settings, mandatory_ok)
+        ems_cells = grp[
+            (grp["EMS_Hours"] > 0) & np.isfinite(grp["ObsLower_m"])
+        ]
+        all_ems_hours = float(ems_cells["EMS_Hours"].sum())
+        all_ems_volume = float(ems_cells["NetVolume_m3"].sum())
+        all_ems_rate_tph = (
+            all_ems_volume / all_ems_hours * settings.bulk_density
+            if all_ems_hours > 0
+            else np.nan
+        )
+        excluded_hours_pct = (
+            (all_ems_hours - float(total_hours)) / all_ems_hours * 100.0
+            if all_ems_hours > 0
+            else np.nan
+        )
+        if np.isfinite(excluded_hours_pct) and excluded_hours_pct > 25.0:
+            log(
+                f"WARNING: licence {licence}: QA filters removed "
+                f"{excluded_hours_pct:.1f}% of EMS hours. Validated rate "
+                f"{rate_tph:.1f} t/h; rate using every cell with EMS time and "
+                f"valid bathymetry {all_ems_rate_tph:.1f} t/h. Dropping "
+                "low-change cells with their hours can raise the validated rate."
+            )
         weighted_median = np.nan
         if len(accepted):
             ordered = accepted.sort_values("ObsRate_tph")
@@ -3837,6 +3933,9 @@ def _run_validation_single(
             "AcceptedVolume_m3": float(total_volume),
             "MeanCoveragePct": float(accepted["CoveragePct"].mean()) if len(accepted) else 0.0,
             "QA_Status": area_status,
+            "AllEMSCellsRate_tph": all_ems_rate_tph,
+            "AllEMSCellsHours": all_ems_hours,
+            "ExcludedEMSHoursPct": excluded_hours_pct,
         })
 
         volume_rate = rate_m3ph
@@ -4218,7 +4317,13 @@ def run_validation(
             log,
         )
 
-    if settings.resolution_mode == RESOLUTION_50:
+    if not settings.write_model_factors:
+        log(
+            "Source-model factor update skipped: writing lowering_factor values "
+            "to the licence GeoPackage is switched off. Review the results, then "
+            "re-run with model write-back switched on to fill blank factors."
+        )
+    elif settings.resolution_mode == RESOLUTION_50:
         log(
             "Source-model factor update skipped: it requires the 250 m regulatory "
             "validation result."
@@ -4246,6 +4351,16 @@ def run_validation(
             "ValidatedRate_m3ph must be finite and > 0; the stored factor is "
             "that rate divided by 250 x 250 m2."
         )
+        for row in factor_summary.itertuples(index=False):
+            rate = pd.to_numeric(
+                pd.Series([getattr(row, "ValidatedRate_m3ph")]), errors="coerce"
+            ).iloc[0]
+            if pd.notna(rate) and np.isfinite(rate) and rate > 0:
+                log(
+                    f"Write-back candidate {getattr(row, 'LicenceNo')}: "
+                    f"{getattr(row, 'ValidatedRate_tph'):.3f} t/h; "
+                    f"QA status {getattr(row, 'QA_Status')}."
+                )
         update_model_lowering_factors(
             settings.licence_layer,
             settings.licence_layer_name,
@@ -4444,7 +4559,7 @@ class App(tk.Tk):
         ttk.Label(fields, text="Dredge comparison").grid(row=12, column=0, sticky="w", padx=6, pady=3)
         self.vars["ems_dredge_mode"] = tk.StringVar(value="equals")
         ttk.Combobox(fields, textvariable=self.vars["ems_dredge_mode"], values=["equals", "greater_or_equal"], state="readonly").grid(row=12, column=1, sticky="ew", padx=6)
-        ttk.Label(fields, text="Difference raster sign (single raster input)").grid(row=13, column=0, sticky="w", padx=6, pady=3)
+        ttk.Label(fields, text="Lowering sign after value convention (single raster input)").grid(row=13, column=0, sticky="w", padx=6, pady=3)
         self.vars["source_sign"] = tk.StringVar(value="positive_is_lowering")
         ttk.Combobox(fields, textvariable=self.vars["source_sign"], values=["positive_is_lowering", "negative_is_lowering"], state="readonly").grid(row=13, column=1, sticky="ew", padx=6)
         ttk.Label(fields, text="Raster value convention").grid(row=14, column=0, sticky="w", padx=6, pady=3)
@@ -4462,6 +4577,14 @@ class App(tk.Tk):
         ttk.Label(fields, text="Analysis extent").grid(row=18, column=0, sticky="w", padx=6, pady=3)
         self.vars["analysis_extent"] = tk.StringVar(value="FULL_OVERLAP")
         ttk.Combobox(fields, textvariable=self.vars["analysis_extent"], values=["TRACK_FOOTPRINT", "VALIDATION_POLYGON", "FULL_OVERLAP"], state="readonly").grid(row=18, column=1, sticky="ew", padx=6)
+        self.vars["write_model_factors"] = tk.StringVar(value="False")
+        ttk.Checkbutton(
+            fields,
+            text="Fill blank lowering_factor values in the licence GeoPackage (250 m)",
+            variable=self.vars["write_model_factors"],
+            onvalue="True",
+            offvalue="False",
+        ).grid(row=19, column=0, columnspan=2, sticky="w", padx=6, pady=3)
 
         qa = ttk.LabelFrame(body, text="3. Calculation and QA settings")
         qa.grid(row=2, column=0, sticky="ew", padx=10, pady=8)
@@ -4498,6 +4621,7 @@ class App(tk.Tk):
         for key in numeric:
             if key in data and data[key] != "":
                 data[key] = float(data[key])
+        data["write_model_factors"] = data.get("write_model_factors") == "True"
         required = ["calibration_grid", "licence_layer", "ems_source", "output_folder"]
         missing = [k for k in required if not data.get(k)]
         if missing:
