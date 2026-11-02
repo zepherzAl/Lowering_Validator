@@ -116,11 +116,33 @@ class PreflightTests(unittest.TestCase):
             _settings(self.root), grid, self.licences, "GridID", raster, lambda _: None
         )
         text = "\n".join(warnings)
-        self.assertIn("1 pairs of grid cells overlap", text)
+        self.assertIn("1 pairs of overlapping grid cells belong to the same licence (137", text)
         self.assertIn("137_1/522_1", text)
         self.assertIn("have no grid cells", text)
         self.assertIn("999", text)
         self.assertIn("Only 5% of raster pixels", text)
+
+    def test_overlaps_outside_licences_or_across_boundaries_do_not_warn(self):
+        licences = gpd.GeoDataFrame(
+            {"LicenceNo": ["137", "522"]},
+            geometry=[box(0, 0, 500, 250), box(500, 0, 1000, 250)],
+            crs="EPSG:27700",
+        )
+        grid = _grid([
+            ("137_1", box(250, 0, 500, 250)),    # in 137
+            ("522_1", box(400, 0, 650, 250)),    # in 522, overlaps 137_1 across the boundary
+            ("out_a", box(2000, 0, 2250, 250)),  # outside every licence
+            ("out_b", box(2100, 0, 2350, 250)),  # outside, overlaps out_a
+        ])
+        raster = {"valid": 10, "positive": 9, "negative": 1, "positive_values_are_lowering": True}
+        messages = []
+        warnings = validator.preflight_checks(
+            _settings(self.root), grid, licences, "GridID", raster, messages.append
+        )
+        self.assertEqual(warnings, [])
+        text = "\n".join(messages)
+        self.assertIn("1 overlapping cell pairs straddle a boundary", text)
+        self.assertIn("1 overlapping cell pairs involve cells outside every licence", text)
 
     def test_clean_inputs_pass(self):
         grid = _grid([("a", box(0, 0, 250, 250)), ("b", box(250, 0, 500, 250))])

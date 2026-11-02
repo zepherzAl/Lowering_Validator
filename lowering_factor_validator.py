@@ -1797,15 +1797,6 @@ def preflight_checks(
     log("Running pre-run checks...")
     warnings: list[str] = []
 
-    overlaps = _grid_overlaps(master_grid, grid_id_column, settings.projected_crs)
-    if overlaps:
-        examples = ", ".join(f"{a}/{b}" for a, b, _ in overlaps[:5])
-        warnings.append(
-            f"{len(overlaps):,} pairs of grid cells overlap (for example {examples}). "
-            "Lowering and EMS hours in overlapping areas are counted twice. "
-            "Use a grid layer with one cell per location."
-        )
-
     licence_field = field_lookup(licences.columns, settings.licence_field)
     work_licences = licences.to_crs(master_grid.crs)
     points = gpd.GeoDataFrame(
@@ -1813,6 +1804,46 @@ def preflight_checks(
     )
     joined = gpd.sjoin(points, work_licences[[licence_field, "geometry"]], predicate="within")
     with_cells = set(joined[licence_field].astype(str))
+
+    # Overlaps only matter when both cells belong to the same licence (the
+    # calculation assigns each cell by its representative point): those
+    # cells count the same seabed twice in one licence's rate. Cells outside
+    # every licence are ignored by the rate, and overlaps between
+    # neighbouring licences' edge cells are a boundary effect.
+    cell_licence = (
+        joined.assign(_id=master_grid.loc[joined.index, grid_id_column].astype(str).values)
+        .drop_duplicates("_id")
+        .set_index("_id")[licence_field]
+        .astype(str)
+    )
+    same, boundary, unlicensed = [], [], 0
+    for a, b, area in _grid_overlaps(master_grid, grid_id_column, settings.projected_crs):
+        licence_a, licence_b = cell_licence.get(a), cell_licence.get(b)
+        if licence_a is None or licence_b is None:
+            unlicensed += 1
+        elif licence_a == licence_b:
+            same.append((a, b, licence_a))
+        else:
+            boundary.append((a, b))
+    if same:
+        examples = ", ".join(f"{a}/{b}" for a, b, _ in same[:5])
+        licences_hit = ", ".join(sorted({licence for _, _, licence in same}))
+        warnings.append(
+            f"{len(same):,} pairs of overlapping grid cells belong to the same licence "
+            f"({licences_hit}; for example {examples}). Lowering and EMS hours there "
+            "are counted twice in that licence's rate. Use a grid layer with one "
+            "cell per location."
+        )
+    if boundary:
+        log(
+            f"Grid check: {len(boundary):,} overlapping cell pairs straddle a boundary "
+            "between neighbouring licences (each cell counts for its own licence only)."
+        )
+    if unlicensed:
+        log(
+            f"Grid check: {unlicensed:,} overlapping cell pairs involve cells outside "
+            "every licence; those cells are not used in any rate."
+        )
     empty = [
         str(value) for value in work_licences[licence_field].astype(str)
         if str(value) not in with_cells

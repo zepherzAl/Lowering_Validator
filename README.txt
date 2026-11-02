@@ -245,7 +245,9 @@ Licences to run: leave blank for all, or type IDs separated by commas, or use
 licences are used. Command line: --licences "137, 522".
 
 Pre-run checks run before the slow EMS stage and report: overlapping grid
-cells (counted twice), licences with no grid cells, blank or reversed survey
+cells that belong to the same licence (counted twice; overlaps involving
+cells outside every licence, or across a boundary between neighbouring
+licences, are only noted in the log), licences with no grid cells, blank or reversed survey
 dates, calendar months in the survey period with no EMS records at all, and a
 raster whose sign settings make few pixels read as lowering. The app asks
 whether to continue; the command line logs them and continues.
